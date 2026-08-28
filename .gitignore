@@ -1,0 +1,33 @@
+# Secrets — .env holds a live GROQ_API_KEY and the database password.
+# .env.example is the tracked template; keep them in sync when adding a setting.
+.env
+.env.local
+.env.*.local
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local model weights, if HF_HOME is ever pointed inside the project.
+# In Docker these live in the `hfcache` named volume, not here.
+.hfcache/
+
+# Superseded Docker/FastAPI/LangGraph version of this project. Delete the
+# directory once you're sure you don't want it back.
+_archive/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

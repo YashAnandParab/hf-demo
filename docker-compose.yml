@@ -1,0 +1,36 @@
+name: structured-rag
+
+services:
+  app:
+    build: .
+    image: structured-rag:latest
+    container_name: structured-rag
+    env_file: .env
+    environment:
+      # Overrides the host-oriented values in .env. Inside the network the
+      # database is reached by container name on its INTERNAL port — 5433 is
+      # only the mapping Docker publishes to your Windows host.
+      POSTGRES_HOST: rag-postgres
+      POSTGRES_PORT: 5432
+      HF_HOME: /app/.hfcache
+    volumes:
+      - ./data:/app/data
+      - hfcache:/app/.hfcache
+    networks:
+      - postgres
+    command: sleep infinity
+    restart: unless-stopped
+
+networks:
+  # The network the existing rag-postgres container (pgvector/pgvector:pg17)
+  # already lives on. This project deliberately does NOT run its own Postgres —
+  # a second one would fight over port 5433 and split your data across two
+  # servers. See the README if you want a self-contained one instead.
+  postgres:
+    external: true
+    name: postgress_default
+
+volumes:
+  # ~1.3GB of embedding + reranker weights. Named so the download survives
+  # `docker compose down` and every image rebuild.
+  hfcache:

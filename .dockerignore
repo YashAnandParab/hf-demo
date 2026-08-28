@@ -1,0 +1,13 @@
+.venv/
+_archive/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+
+# passed in at runtime via env_file, never baked into the image
+.env
+
+# bind-mounted at runtime
+data/

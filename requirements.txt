@@ -1,0 +1,9 @@
+psycopg[binary]>=3.1
+python-dotenv>=1.0
+sentence-transformers>=3.0
+groq>=0.11
+pytest>=8.0
+
+# torch arrives as a sentence-transformers dependency. For a CPU-only install
+# (much smaller than the default CUDA build), install it first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
