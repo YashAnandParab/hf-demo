@@ -56,24 +56,46 @@ DATABASE_URL = os.getenv("DATABASE_URL") or (
 )
 
 # -------------------------------------------------------------- embeddings ---
-# Local sentence-transformers model. bge-large-en-v1.5 is 1024-dim; switching to
-# bge-base (768) or bge-small (384) means changing EMBED_DIM and re-ingesting
-# with --reset, because the vector() column width is fixed at table creation.
-EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-large-en-v1.5")
+# Local sentence-transformers model. bge-m3 is 1024-dim with an 8192-token window,
+# so it embeds a long chunk whole where bge-large-en-v1.5 truncated at 512.
+# Both are 1024-dim, so moving between them needs no schema change — but it does
+# need `--reset` and a re-ingest, because vectors from one model are meaningless
+# in the other's space. bge-base (768) or bge-small (384) additionally require
+# changing EMBED_DIM, since the vector() column width is fixed at table creation.
+EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 EMBED_DIM = _int("EMBED_DIM", 1024)
 EMBED_BATCH_SIZE = _int("EMBED_BATCH_SIZE", 32)
 EMBED_DEVICE = os.getenv("EMBED_DEVICE", "") or None  # None -> auto (cuda if present)
 
-# bge models expect this instruction on the QUERY side only. Documents go in bare.
-EMBED_QUERY_PREFIX = os.getenv(
-    "EMBED_QUERY_PREFIX", "Represent this sentence for searching relevant passages: "
-)
+
+def _default_query_prefix(model: str) -> str:
+    """The retrieval instruction the model was trained to expect on queries.
+
+    This differs BETWEEN bge generations, and getting it wrong fails silently —
+    retrieval simply gets worse, with nothing in the logs. The v1.5 English models
+    were trained with an instruction on the query side; bge-m3 was not, and
+    prepending one to every query just adds noise the model never saw in training.
+    Deriving it from the model name means switching EMBED_MODEL cannot leave the
+    wrong prefix behind. Set EMBED_QUERY_PREFIX to override.
+    """
+    name = model.lower()
+    if "bge-m3" in name:
+        return ""
+    if "bge" in name and "-en" in name:
+        return "Represent this sentence for searching relevant passages: "
+    return ""
+
+
+# An empty value is a legitimate setting, so os.getenv's default is not enough:
+# EMBED_QUERY_PREFIX= in .env must mean "no prefix", not "fall back to the default".
+_raw_prefix = os.getenv("EMBED_QUERY_PREFIX")
+EMBED_QUERY_PREFIX = _default_query_prefix(EMBED_MODEL) if _raw_prefix is None else _raw_prefix
 
 # ---------------------------------------------------------------- reranker ---
 # local -> sentence-transformers CrossEncoder
 # none  -> keep fusion order (no torch needed at query time)
 RERANKER_BACKEND = os.getenv("RERANKER_BACKEND", "local").lower()
-RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
 # -------------------------------------------------------------- generation ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -102,13 +124,20 @@ WEIGHT_FTS = _float("WEIGHT_FTS", 0.8)
 WEIGHT_HQ = _float("WEIGHT_HQ", 1.0)
 
 # ------------------------------------------------------- structured RAG -----
-# knowledge_only -> the three arms search knowledge chunks only (default);
-#                   stories arrive afterwards through the link table
-# include        -> stories compete in the arms too, so an UNLINKED story is
-#                   still reachable, at some cost to knowledge precision
-STORY_RETRIEVAL_MODE = os.getenv("STORY_RETRIEVAL_MODE", "knowledge_only").lower()
+# Stories are never retrieval candidates: they carry no embedding and are absent
+# from the full-text index. They reach the model only by being attached, through
+# the link table, to a knowledge chunk that survived reranking.
 ATTACH_LINKED_STORIES = _bool("ATTACH_LINKED_STORIES", True)
 MAX_LINKED_STORIES = _int("MAX_LINKED_STORIES", 2)
+
+# --------------------------------------------------------------- langsmith ---
+# Tracing is opt-in and degrades to a no-op: with no key set, the decorators in
+# tracing.py pass the function through untouched and nothing leaves the machine.
+LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY", "") or os.getenv("LANGCHAIN_API_KEY", "")
+LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "hf-demo-rag")
+LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+# explicit off-switch that works even when a key is present
+LANGSMITH_TRACING = _bool("LANGSMITH_TRACING", True)
 
 # -------------------------------------------------------------------- misc ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

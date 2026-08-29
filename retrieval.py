@@ -1,20 +1,22 @@
 """Structured retrieval.
 
-Retrieval is knowledge-first: all three arms are restricted to knowledge chunks,
-and story chunks are attached afterwards through the story->knowledge link table.
-This keeps narrative from crowding out the factual passages during fusion, while
-still making the story available to the LLM as illustration.
+Retrieval is knowledge-only, structurally rather than by convention: story chunks
+carry no embedding and are excluded from the full-text index, so no arm can
+return one even if it wanted to. Stories are attached afterwards by walking the
+knowledge->story link table from whichever knowledge chunks survived reranking.
 
-Story chunks are long, vivid and lexically rich, so they beat the terser
-knowledge chunks in both vector and full-text ranking — which is exactly the
-wrong outcome when the question is asking for the fact. Set
-STORY_RETRIEVAL_MODE=include to let them compete anyway.
+The reason is that story chunks are long, vivid and lexically rich, so they beat
+the terser knowledge chunks in both vector and full-text ranking — exactly the
+wrong outcome when the question is asking for the fact. Under this design a story
+is never something the retriever chooses; it is context that comes along with the
+fact it illustrates.
 """
 from __future__ import annotations
 
 import logging
 
 import config
+import tracing
 from db import fetch_all, to_pgvector
 
 log = logging.getLogger("retrieval")
@@ -26,17 +28,9 @@ _SELECT = """
     c.source_chunk_id,
     c.chunk_text,
     c.content_type,
-    c.story_summary,
     a.article_name,
     a.article_url
 """
-
-
-def _type_filter() -> str:
-    """SQL predicate limiting the arms to knowledge, unless stories are included."""
-    if config.STORY_RETRIEVAL_MODE == "include":
-        return "TRUE"
-    return "c.content_type = 'knowledge'"
 
 
 VECTOR_SQL = f"""
@@ -44,7 +38,7 @@ SELECT {_SELECT},
        1 - (c.embedding <=> %s::vector) AS score
 FROM structured_chunks c
 JOIN articles a USING (article_id)
-WHERE {{type_filter}} AND c.embedding IS NOT NULL
+WHERE c.content_type = 'knowledge' AND c.embedding IS NOT NULL
 ORDER BY c.embedding <=> %s::vector
 LIMIT %s
 """
@@ -55,7 +49,7 @@ SELECT {_SELECT},
 FROM structured_chunks c
 JOIN articles a USING (article_id),
      websearch_to_tsquery('english', %s) AS q(query)
-WHERE {{type_filter}} AND c.search_vector @@ q.query
+WHERE c.content_type = 'knowledge' AND c.search_vector @@ q.query
 ORDER BY score DESC
 LIMIT %s
 """
@@ -71,13 +65,15 @@ SELECT * FROM (
     FROM structured_chunk_questions q
     JOIN structured_chunks c USING (chunk_id)
     JOIN articles a USING (article_id)
-    WHERE {{type_filter}} AND q.embedding IS NOT NULL
+    WHERE c.content_type = 'knowledge' AND q.embedding IS NOT NULL
     ORDER BY c.chunk_id, q.embedding <=> %s::vector
 ) ranked
 ORDER BY score DESC
 LIMIT %s
 """
 
+# A story may be cited by knowledge chunks in other articles, so this join is not
+# constrained to the parent's article.
 LINKED_STORIES_SQL = f"""
 SELECT {_SELECT},
        l.knowledge_chunk_id,
@@ -89,43 +85,38 @@ WHERE l.knowledge_chunk_id = ANY(%s)
 ORDER BY l.knowledge_chunk_id, l.position, c.chunk_index
 """
 
-STORY_VECTOR_SQL = f"""
-SELECT {_SELECT},
-       1 - (c.embedding <=> %s::vector) AS score
-FROM structured_chunks c
-JOIN articles a USING (article_id)
-WHERE c.content_type = 'story' AND c.embedding IS NOT NULL
-ORDER BY c.embedding <=> %s::vector
-LIMIT %s
-"""
 
-
+@tracing.traceable(
+    run_type="retriever", name="vector_search", process_inputs=tracing.hide("query_embedding")
+)
 def vector_search(query_embedding: list[float], top_k: int | None = None) -> list[dict]:
     vec = to_pgvector(query_embedding)
-    sql = VECTOR_SQL.format(type_filter=_type_filter())
-    return fetch_all(sql, (vec, vec, top_k or config.VECTOR_TOP_K))
+    return fetch_all(VECTOR_SQL, (vec, vec, top_k or config.VECTOR_TOP_K))
 
 
+@tracing.traceable(run_type="retriever", name="fts_search")
 def fts_search(query: str, top_k: int | None = None) -> list[dict]:
     if not query.strip():
         return []
-    sql = FTS_SQL.format(type_filter=_type_filter())
-    return fetch_all(sql, (query, top_k or config.FTS_TOP_K))
+    return fetch_all(FTS_SQL, (query, top_k or config.FTS_TOP_K))
 
 
+@tracing.traceable(
+    run_type="retriever", name="hq_search", process_inputs=tracing.hide("query_embedding")
+)
 def hq_search(query_embedding: list[float], top_k: int | None = None) -> list[dict]:
     vec = to_pgvector(query_embedding)
-    sql = HQ_SQL.format(type_filter=_type_filter())
-    return fetch_all(sql, (vec, vec, top_k or config.HQ_TOP_K))
+    return fetch_all(HQ_SQL, (vec, vec, top_k or config.HQ_TOP_K))
 
 
+@tracing.traceable(run_type="retriever", name="linked_stories")
 def linked_stories(knowledge_chunk_ids: list[int], max_per_chunk: int | None = None) -> list[dict]:
-    """Fetch story chunks attached to the given knowledge chunks.
+    """Fetch the story chunks cited by the given knowledge chunks.
 
-    A story may illustrate several knowledge chunks, so it can come back on more
-    than one parent. It is de-duplicated to a single row carrying every parent it
-    matched, in `illustrates_chunk_ids` — which is what produces the
-    "illustrates K1, K3" label in the context.
+    One story may be cited by several of the surviving knowledge chunks, so it can
+    come back on more than one parent. It is de-duplicated to a single row carrying
+    every parent it matched, in `illustrates_chunk_ids` — which is what produces
+    the "illustrates K1, K3" label in the context.
     """
     if not knowledge_chunk_ids:
         return []
@@ -160,27 +151,23 @@ def label_stories(stories: list[dict], knowledge: list[dict]) -> list[dict]:
     return stories
 
 
-def story_search(query_embedding: list[float], top_k: int | None = None) -> list[dict]:
-    """Direct similarity search over story embeddings. For inspection only."""
-    vec = to_pgvector(query_embedding)
-    return fetch_all(STORY_VECTOR_SQL, (vec, vec, top_k or config.VECTOR_TOP_K))
-
-
 def stats() -> dict:
     return fetch_all(
         """
-        SELECT (SELECT count(*) FROM articles)                                       AS articles,
-               (SELECT count(*) FROM structured_chunks WHERE content_type='knowledge') AS knowledge_chunks,
-               (SELECT count(*) FROM structured_chunks WHERE content_type='story')     AS story_chunks,
-               (SELECT count(*) FROM structured_chunk_links)                           AS story_links,
+        SELECT (SELECT count(*) FROM articles)                                          AS articles,
+               (SELECT count(*) FROM structured_chunks WHERE content_type='knowledge')   AS knowledge_chunks,
+               (SELECT count(*) FROM structured_chunks WHERE content_type='story')       AS story_chunks,
+               (SELECT count(*) FROM structured_chunk_links)                             AS story_links,
+               (SELECT count(*) FROM structured_chunk_links l
+                  JOIN structured_chunks k ON k.chunk_id = l.knowledge_chunk_id
+                  JOIN structured_chunks s ON s.chunk_id = l.story_chunk_id
+                 WHERE k.article_id <> s.article_id)                                     AS cross_article_links,
                (SELECT count(*) FROM structured_chunks s
                  WHERE s.content_type = 'story'
                    AND NOT EXISTS (SELECT 1 FROM structured_chunk_links l
-                                    WHERE l.story_chunk_id = s.chunk_id))              AS orphan_stories,
-               (SELECT count(*) FROM structured_chunks WHERE embedding IS NULL)        AS missing_embeddings,
-               (SELECT count(*) FROM structured_chunk_questions)                       AS questions,
-               (SELECT count(*) FROM structured_chunk_questions q
-                  JOIN structured_chunks c USING (chunk_id)
-                 WHERE c.content_type = 'story')                                       AS story_questions
+                                    WHERE l.story_chunk_id = s.chunk_id))                AS orphan_stories,
+               (SELECT count(*) FROM structured_chunks
+                 WHERE content_type = 'knowledge' AND embedding IS NULL)                 AS missing_embeddings,
+               (SELECT count(*) FROM structured_chunk_questions)                         AS questions
         """
     )[0]

@@ -119,6 +119,38 @@ def tables_exist() -> bool:
     return bool(fetch_all("SELECT to_regclass('public.structured_chunks') AS t")[0]["t"])
 
 
+def check_schema_version() -> None:
+    """Refuse to run against tables built for the story->knowledge link direction.
+
+    `init_schema()` is all CREATE ... IF NOT EXISTS, so it is a no-op against an
+    existing database and would leave the old columns in place. Without this the
+    first insert fails on a missing column, several statements into a run that has
+    already deleted rows.
+    """
+    if not tables_exist():
+        return
+    legacy = fetch_all(
+        """
+        SELECT
+          EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'structured_chunks'
+                     AND column_name = 'story_summary')       AS has_summary,
+          NOT EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'structured_chunk_links'
+                         AND column_name = 'knowledge_chunk_id') AS missing_link_column
+        """
+    )[0]
+    if legacy["has_summary"] or legacy["missing_link_column"]:
+        raise SystemExit(
+            "These tables were built for the old schema (story summaries, and links\n"
+            "declared story -> knowledge). The current schema drops story summaries and\n"
+            "story embeddings entirely and declares links knowledge -> story, so the two\n"
+            "cannot coexist.\n"
+            "  Re-run with --reset to drop and rebuild (this deletes all ingested chunks):\n"
+            "      python ingest.py data/chunks.json --reset"
+        )
+
+
 def check_embed_dim() -> None:
     """Fail loudly when the table was built for a different embedding model."""
     rows = fetch_all(

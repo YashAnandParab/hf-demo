@@ -17,8 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py schema.sql ./
 
-# Model weights land in HF_HOME, which is a named volume, so the ~1.3GB download
-# happens once and survives rebuilds.
+# Model weights land in HF_HOME, which compose bind-mounts to the host's own
+# HuggingFace cache — so the ~4.6GB for bge-m3 and its reranker is downloaded once
+# and shared with the local venv, rather than once per environment.
 #
 # The container idles rather than running anything: this is a CLI tool, so you
 # exec into it.

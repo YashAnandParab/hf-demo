@@ -1,7 +1,7 @@
 """Local embedding and reranking models.
 
 Both are loaded lazily and cached, so importing this module is cheap and a
-`--dry-run` never pulls ~1.7GB of weights. In the REPL the models stay resident
+`--dry-run` never pulls ~4.6GB of weights. In the REPL the models stay resident
 between questions, which is why `query.py --repl` is much faster than repeated
 one-shot invocations.
 """
@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Sequence
 
 import config
+import tracing
 
 log = logging.getLogger("models")
 
@@ -43,6 +44,11 @@ def embed_documents(texts: Sequence[str], batch_size: int | None = None) -> list
     return [v.tolist() for v in vectors]
 
 
+@tracing.traceable(
+    run_type="embedding",
+    name="embed_query",
+    process_outputs=tracing.vector_output,
+)
 def embed_query(text: str) -> list[float]:
     """Embed a question. bge asks for a retrieval instruction on the query side."""
     vector = _embedder().encode(
@@ -73,12 +79,14 @@ def _cross_encoder():
     return CrossEncoder(config.RERANKER_MODEL, device=config.EMBED_DEVICE)
 
 
+@tracing.traceable(run_type="chain", name="rerank")
 def rerank(question: str, candidates: list[dict], top_k: int | None = None) -> list[dict]:
-    """Cross-encoder rerank, scoring the text the chunk was indexed under.
+    """Cross-encoder rerank over the fused candidates.
 
-    A story is judged on its summary, since that is what it was embedded as. If
-    the reranker is disabled or fails, fusion order is kept rather than failing
-    the query — a worse ordering still answers the question.
+    Every candidate is a knowledge chunk scored on its own text — the text it was
+    embedded and indexed under. If the reranker is disabled or fails, fusion order
+    is kept rather than failing the query: a worse ordering still answers the
+    question.
     """
     top_k = config.RERANK_TOP_K if top_k is None else top_k
     if not candidates:
@@ -88,10 +96,7 @@ def rerank(question: str, candidates: list[dict], top_k: int | None = None) -> l
         return candidates[:top_k]
 
     try:
-        pairs = [
-            (question, _rerank_text(hit))
-            for hit in candidates
-        ]
+        pairs = [(question, hit.get("chunk_text") or "") for hit in candidates]
         scores = _cross_encoder().predict(pairs, show_progress_bar=False)
     except Exception as exc:  # noqa: BLE001
         log.warning("reranker failed (%s); keeping fusion order", exc)
@@ -100,10 +105,9 @@ def rerank(question: str, candidates: list[dict], top_k: int | None = None) -> l
     for hit, score in zip(candidates, scores):
         hit["rerank_score"] = float(score)
     ranked = sorted(candidates, key=lambda h: h["rerank_score"], reverse=True)
+    tracing.add_metadata(
+        reranker=config.RERANKER_MODEL,
+        candidates_in=len(candidates),
+        kept=len(ranked[:top_k]),
+    )
     return ranked[:top_k]
-
-
-def _rerank_text(hit: dict) -> str:
-    if hit.get("content_type") == "story" and hit.get("story_summary"):
-        return hit["story_summary"]
-    return hit.get("chunk_text") or ""

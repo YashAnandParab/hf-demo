@@ -4,7 +4,8 @@ No database, no models, no API key. `pytest -q` from the project root.
 
 The link-resolution test uses a fake cursor that mimics `RETURNING chunk_id`, so
 the two-pass id mapping — the part most likely to silently corrupt data — is
-exercised for real.
+exercised for real, including the cross-article case that a per-article map used
+to drop.
 """
 from __future__ import annotations
 
@@ -21,8 +22,9 @@ from loader import (
     parse_objects,
 )
 
-# Mirrors the real file: concatenated multi-line objects, trailing commas,
-# mixed chunk_type casing, and list-valued links.
+# Mirrors the real file: concatenated multi-line objects, trailing commas, mixed
+# chunk_type casing, list-valued links declared on the KNOWLEDGE chunk, and one
+# link that reaches into another article.
 SAMPLE = """
 {"chunk_id": 12,
   "title": "The Shift Most Investors Need To Make",
@@ -32,19 +34,20 @@ SAMPLE = """
   "site": "Happyrich Investor",
   "chunk_type": "Knowledge",
   "chunk":"Investing is about answering five simple questions.",
+  "related_story_chunk_ids": [13, 1],
 }
 {"chunk_id": 13,
   "title": "The Shift Most Investors Need To Make",
   "source": "https://example.com/shift",
   "chunk_type": "story",
-  "chunk":"Rohit is 42. When I asked how much he will need, he paused.",
-  "related_knowledge_chunk_ids": [12, 14]
+  "chunk":"Rohit is 42. When I asked how much he will need, he paused."
 }
 {"chunk_id": 14,
   "title": "The Shift Most Investors Need To Make",
   "source": "https://example.com/shift",
   "chunk_type": "Knowledge",
-  "chunk":"The five questions are about saving, risk, need, timing and legacy."
+  "chunk":"The five questions are about saving, risk, need, timing and legacy.",
+  "related_story_chunk_ids": 13
 }
 {"chunk_id": 1,
   "title": "The Cheesecake Factory Menu",
@@ -122,11 +125,35 @@ def test_field_aliases_and_casing():
 def test_scalar_link_is_coerced_to_a_list():
     report = LoadReport()
     chunk = normalise(
-        {"chunk_id": 2, "title": "T", "chunk_type": "story", "chunk": "x",
-         "related_knowledge_chunk_id": 7},
+        {"chunk_id": 2, "title": "T", "chunk_type": "knowledge", "chunk": "x",
+         "related_story_chunk_id": 7},
         report,
     )
     assert chunk.links == [7]
+
+
+def test_links_declared_on_a_story_are_dropped():
+    """Only knowledge chunks declare links now; the reverse is a leftover."""
+    report = LoadReport()
+    chunk = normalise(
+        {"chunk_id": 2, "title": "T", "chunk_type": "story", "chunk": "x",
+         "related_story_chunk_ids": [7]},
+        report,
+    )
+    assert chunk.links == []
+    assert any("story chunk declares links" in w for w in report.warnings)
+
+
+def test_old_link_direction_is_rejected_with_a_migration_note():
+    """A file in the pre-inversion format must fail loudly, not ingest linkless."""
+    report = LoadReport()
+    normalise(
+        {"chunk_id": 2, "title": "T", "chunk_type": "story", "chunk": "x",
+         "related_knowledge_chunk_ids": [12, 14]},
+        report,
+    )
+    assert report.legacy_link_keys == 1
+    assert any("related_story_chunk_ids" in e for e in report.errors)
 
 
 def test_unknown_chunk_type_is_rejected():
@@ -158,32 +185,49 @@ def test_groups_by_source_url():
     assert {len(g) for g in groups.values()} == {3, 1}
 
 
-def test_audit_flags_orphan_story():
+def test_audit_flags_a_story_nothing_points_at():
+    report = LoadReport()
+    chunks = [
+        normalise({"chunk_id": 1, "title": "T", "chunk_type": "knowledge", "chunk": "k"}, report),
+        normalise({"chunk_id": 2, "title": "T", "chunk_type": "story", "chunk": "s"}, report),
+    ]
+    audit(chunks, report)
+    assert any("no knowledge chunk points at" in w for w in report.warnings)
+
+
+def test_audit_is_quiet_when_every_story_is_cited():
     chunks, report = _sample_chunks()
     audit(chunks, report)
-    assert any("story with no links" in w for w in report.warnings)
+    assert not any("points at" in w for w in report.warnings)
+
+
+def test_audit_counts_a_cross_article_link_without_warning():
+    """Knowledge 12 cites story 1 in another article. That is allowed now."""
+    chunks, report = _sample_chunks()
+    audit(chunks, report)
+    assert report.cross_article_links == 1
+    assert not any("crosses articles" in w for w in report.warnings)
 
 
 def test_audit_flags_dangling_link():
     report = LoadReport()
     chunks = [
-        normalise({"chunk_id": 1, "title": "T", "chunk_type": "knowledge", "chunk": "k"}, report),
-        normalise({"chunk_id": 2, "title": "T", "chunk_type": "story", "chunk": "s",
-                   "related_knowledge_chunk_ids": [99]}, report),
+        normalise({"chunk_id": 1, "title": "T", "chunk_type": "knowledge", "chunk": "k",
+                   "related_story_chunk_ids": [99]}, report),
     ]
     audit(chunks, report)
     assert any("no such chunk_id" in w for w in report.warnings)
 
 
-def test_audit_flags_story_linked_to_a_story():
+def test_audit_flags_knowledge_linked_to_knowledge():
     report = LoadReport()
     chunks = [
-        normalise({"chunk_id": 1, "title": "T", "chunk_type": "story", "chunk": "a"}, report),
-        normalise({"chunk_id": 2, "title": "T", "chunk_type": "story", "chunk": "b",
-                   "related_knowledge_chunk_ids": [1]}, report),
+        normalise({"chunk_id": 1, "title": "T", "chunk_type": "knowledge", "chunk": "a"}, report),
+        normalise({"chunk_id": 2, "title": "T", "chunk_type": "knowledge", "chunk": "b",
+                   "related_story_chunk_ids": [1]}, report),
     ]
     audit(chunks, report)
-    assert any("not knowledge" in w for w in report.warnings)
+    assert any("not a story" in w for w in report.warnings)
 
 
 def test_loads_from_disk(tmp_path: Path):
@@ -224,46 +268,65 @@ class FakeCursor:
         return self._last
 
 
-def test_two_pass_resolution_maps_author_ids_to_db_ids():
-    """Author ids 12/13/14 must resolve to DB ids, not be inserted verbatim."""
-    chunks, _ = _sample_chunks()
-    shift = [c for c in chunks if c.article_url.endswith("/shift")]
-
+def _resolve(chunks):
+    """The global two-pass resolution ingest_all performs, minus the database."""
     cur = FakeCursor()
-    knowledge = [c for c in shift if c.content_type == "knowledge"]
-    stories = [c for c in shift if c.content_type == "story"]
-    by_source = {c.source_chunk_id: c for c in shift}
-
     source_to_db: dict[int, int] = {}
-    for c in knowledge:
-        cur.execute("INSERT INTO structured_chunks ... RETURNING chunk_id", (c.source_chunk_id,))
-        source_to_db[c.source_chunk_id] = cur.fetchone()["chunk_id"]
+    inserted: list[tuple] = []
 
-    story_db_ids = []
-    for c in stories:
-        cur.execute("INSERT INTO structured_chunks ... RETURNING chunk_id", (c.source_chunk_id,))
-        story_db_ids.append(cur.fetchone()["chunk_id"])
+    for chunk in chunks:
+        cur.execute("INSERT INTO structured_chunks ... RETURNING chunk_id", (chunk.source_chunk_id,))
+        db_id = cur.fetchone()["chunk_id"]
+        inserted.append((chunk, db_id))
+        if chunk.source_chunk_id is not None:
+            source_to_db[chunk.source_chunk_id] = db_id
 
+    by_source = {c.source_chunk_id: c for c, _ in inserted}
     rows = []
-    for c, db_id in zip(stories, story_db_ids):
-        for pos, target in enumerate(c.links):
+    for chunk, db_id in inserted:
+        if chunk.content_type != "knowledge":
+            continue
+        for pos, target in enumerate(chunk.links):
             tdb, traw = source_to_db.get(target), by_source.get(target)
-            if tdb and traw and traw.content_type == "knowledge":
+            if tdb and traw and traw.content_type == "story":
                 rows.append((db_id, tdb, pos))
-
-    # knowledge 12 -> 1000, knowledge 14 -> 1001, story 13 -> 1002
-    assert source_to_db == {12: 1000, 14: 1001}
-    # the story links to BOTH knowledge chunks, in the order given
-    assert rows == [(1002, 1000, 0), (1002, 1001, 1)]
+    return source_to_db, rows
 
 
-def test_link_to_a_chunk_in_another_article_is_dropped():
+def test_two_pass_resolution_maps_author_ids_to_db_ids():
+    """Author ids 12/13/14/1 must resolve to DB ids, not be inserted verbatim."""
     chunks, _ = _sample_chunks()
-    by_source = {c.source_chunk_id: c for c in chunks}
-    # chunk 1 (cheesecake) is not in the shift article's id map
-    shift_ids = {c.source_chunk_id for c in chunks if c.article_url.endswith("/shift")}
-    assert 1 not in shift_ids
-    assert by_source[1].article_url.endswith("/cheesecake")
+    source_to_db, rows = _resolve(chunks)
+
+    assert source_to_db == {12: 1000, 13: 1001, 14: 1002, 1: 1003}
+    # knowledge 12 cites stories 13 and 1, in the order given
+    assert (1000, 1001, 0) in rows
+    assert (1000, 1003, 1) in rows
+    # knowledge 14's scalar link resolved too
+    assert (1002, 1001, 0) in rows
+    assert len(rows) == 3
+
+
+def test_cross_article_link_resolves_because_the_map_is_global():
+    """Story 1 lives in the cheesecake article; knowledge 12 lives in shift."""
+    chunks, _ = _sample_chunks()
+    twelve = next(c for c in chunks if c.source_chunk_id == 12)
+    one = next(c for c in chunks if c.source_chunk_id == 1)
+    assert twelve.article_url != one.article_url
+
+    _, rows = _resolve(chunks)
+    assert (1000, 1003, 1) in rows, "cross-article link was dropped"
+
+
+def test_link_to_a_knowledge_chunk_is_not_written():
+    report = LoadReport()
+    chunks = [
+        normalise({"chunk_id": 1, "title": "T", "chunk_type": "knowledge", "chunk": "a"}, report),
+        normalise({"chunk_id": 2, "title": "T", "chunk_type": "knowledge", "chunk": "b",
+                   "related_story_chunk_ids": [1]}, report),
+    ]
+    _, rows = _resolve(chunks)
+    assert rows == []
 
 
 # --------------------------------------------------------------------------- #

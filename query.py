@@ -11,8 +11,13 @@ The pipeline:
            ├─ fts_search   ─┼─ fuse ─ rerank ─ attach_stories ─ generate
            └─ hq_search    ─┘
 
-All three arms run over knowledge chunks only; `attach_stories` then walks the
-story->knowledge link table to hand the model the illustration alongside the fact.
+All three arms run over knowledge chunks only — stories have no embedding and are
+not in the full-text index, so they cannot appear as candidates. `attach_stories`
+then walks the knowledge->story link table to hand the model the illustration
+alongside the fact that cited it.
+
+With LANGSMITH_API_KEY set, one call to `run` is one trace tree, with each stage
+below as a child run.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ import db
 import models
 import prompts
 import retrieval
+import tracing
 from fusion import reciprocal_rank_fusion
 from llm import chat
 
@@ -37,6 +43,7 @@ THIN = "-" * 78
 # --------------------------------------------------------------------------- #
 
 
+@tracing.traceable(run_type="chain", name="structured_rag")
 def run(
     question: str,
     *,
@@ -72,6 +79,8 @@ def run(
     if verbose:
         _print_arms(arms, fetch_k)
 
+    tracing.add_metadata(**{f"{name}_hits": len(hits) for name, hits in arms.items()})
+
     # ---- stage 2: fusion -------------------------------------------------
     with _timer("fuse", timings):
         fused = reciprocal_rank_fusion(arms)
@@ -105,6 +114,13 @@ def run(
                 answer = chat(prompts.STRUCTURED_SYSTEM, prompts.build_user_prompt(question, context))
     if verbose:
         _print_answer(answer, generate, timings)
+
+    tracing.add_metadata(
+        knowledge_chunk_ids=[h["chunk_id"] for h in knowledge],
+        story_chunk_ids=[h["chunk_id"] for h in stories],
+        context_chars=len(context),
+        **{f"ms_{k}": v for k, v in timings.items()},
+    )
 
     return {
         "question": question,
@@ -141,15 +157,29 @@ def _preview(text: str | None, width: int = 88) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+def _ref(hit: dict) -> str:
+    """Identify a chunk by the id YOU gave it in the JSON, not Postgres' own.
+
+    These drift apart and the gap widens through the file: `source_chunk_id` is the
+    hand-assigned `chunk_id` from data/chunks.json, while `chunk_id` is the
+    database's identity sequence, which skips nothing and so runs ahead wherever a
+    JSON id was absent or a chunk was rejected. Printing only the database id makes
+    every stage impossible to trace back to the source file — json#50 and db#49 are
+    the same row, and neither number alone tells you that.
+    """
+    source = hit.get("source_chunk_id")
+    db_id = hit.get("chunk_id")
+    return f"json#{source} (db {db_id})" if source is not None else f"db#{db_id}"
+
+
 def _print_arms(arms: dict[str, list[dict]], fetch_k: int) -> None:
-    scope = "knowledge only" if config.STORY_RETRIEVAL_MODE != "include" else "knowledge + stories"
-    print(f"\nSTAGE 1 — retrieval arms  (fetch_k={fetch_k}, scope: {scope})")
+    print(f"\nSTAGE 1 — retrieval arms  (fetch_k={fetch_k}, scope: knowledge only)")
     for name, hits in arms.items():
         if not hits:
             print(f"  {name:<7} 0 hits   {_empty_arm_hint(name)}")
             continue
         top = hits[0]
-        print(f"  {name:<7} {len(hits):>2} hits   best #{top['chunk_id']} "
+        print(f"  {name:<7} {len(hits):>2} hits   best {_ref(top)} "
               f"score={float(top.get('score') or 0):.4f}")
         if name == "hq" and top.get("matched_question"):
             print(f"          via question: \"{_preview(top['matched_question'], 70)}\"")
@@ -176,8 +206,8 @@ def _print_fusion(fused: list[dict]) -> None:
     for hit in fused[:8]:
         sources = "+".join(hit.get("sources", []))
         print(
-            f"  {hit['fusion_rank']:>2}. #{hit['chunk_id']:<5} {hit['fusion_score']:.5f}  "
-            f"[{sources:<15}] {_preview(hit.get('chunk_text'), 60)}"
+            f"  {hit['fusion_rank']:>2}. {_ref(hit):<22} {hit['fusion_score']:.5f}  "
+            f"[{sources:<15}] {_preview(hit.get('chunk_text'), 55)}"
         )
 
 
@@ -191,8 +221,8 @@ def _print_rerank(knowledge: list[dict], show_text: bool) -> None:
         score = hit.get("rerank_score")
         score_text = f"{score:+.3f}" if score is not None else f"{hit['fusion_score']:.5f}"
         moved = f"was #{hit.get('fusion_rank')}"
-        print(f"  K{i}  #{hit['chunk_id']:<5} {score_text:>8}  ({moved:<7})  "
-              f"{hit.get('article_name', '')[:40]}")
+        print(f"  K{i}  {_ref(hit):<22} {score_text:>8}  ({moved:<7})  "
+              f"{hit.get('article_name', '')[:45]}")
         print(f"      {_preview(hit.get('chunk_text')) if not show_text else hit.get('chunk_text')}")
 
 
@@ -202,13 +232,11 @@ def _print_stories(stories: list[dict], attached: bool, show_text: bool) -> None
         print("  disabled (ATTACH_LINKED_STORIES=false)")
         return
     if not stories:
-        print("  none — no story links to the surviving knowledge chunks")
+        print("  none — none of the surviving knowledge chunks cites a story")
         return
     for i, hit in enumerate(stories, start=1):
         label = hit.get("linked_knowledge_label") or "?"
-        print(f"  S{i}  #{hit['chunk_id']:<5} illustrates {label:<12} {hit.get('article_name', '')[:40]}")
-        if hit.get("story_summary"):
-            print(f"      summary: {_preview(hit['story_summary'])}")
+        print(f"  S{i}  {_ref(hit):<22} illustrates {label:<12} {hit.get('article_name', '')[:45]}")
         print(f"      {_preview(hit.get('chunk_text')) if not show_text else hit.get('chunk_text')}")
 
 
@@ -232,6 +260,7 @@ def _preflight() -> None:
     db.wait_for_db()
     if not db.tables_exist():
         raise SystemExit("tables do not exist yet — run: python ingest.py data/chunks.json")
+    db.check_schema_version()
     db.check_embed_dim()
     counts = retrieval.stats()
     if counts["knowledge_chunks"] == 0:
@@ -239,20 +268,16 @@ def _preflight() -> None:
     print(
         f"indexed: {counts['articles']} articles, {counts['knowledge_chunks']} knowledge, "
         f"{counts['story_chunks']} story ({counts['orphan_stories']} orphaned), "
+        f"{counts['story_links']} links ({counts['cross_article_links']} cross-article), "
         f"{counts['questions']} questions"
     )
-    # Questions are generated at ingest time based on the mode in force *then*. Flipping
-    # to `include` afterwards leaves the HQ arm blind to stories until a re-ingest.
-    if (
-        config.STORY_RETRIEVAL_MODE == "include"
-        and counts["story_chunks"]
-        and not counts["story_questions"]
-    ):
+    if counts["orphan_stories"]:
         print(
-            "  warning: STORY_RETRIEVAL_MODE=include, but no story has hypothetical\n"
-            "  questions — they were ingested in knowledge_only mode. The vector and\n"
-            "  fts arms still reach stories; the hq arm does not. Re-ingest to fix."
+            f"  note: {counts['orphan_stories']} story chunk(s) are cited by no knowledge "
+            f"chunk, so nothing can reach them."
         )
+    if tracing.enabled():
+        print(f"  tracing to LangSmith project {config.LANGSMITH_PROJECT!r}")
 
 
 def repl(args) -> None:
@@ -330,4 +355,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     finally:
+        tracing.flush()
         db.close()

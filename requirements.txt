@@ -2,6 +2,9 @@ psycopg[binary]>=3.1
 python-dotenv>=1.0
 sentence-transformers>=3.0
 groq>=0.11
+# tracing only. Without a LANGSMITH_API_KEY the decorators in tracing.py are a
+# no-op, and the package not being installed is handled too.
+langsmith>=0.2
 pytest>=8.0
 
 # torch arrives as a sentence-transformers dependency. For a CPU-only install

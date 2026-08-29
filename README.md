@@ -20,7 +20,8 @@ survived reranking, and what the answer was actually built from.
 
 ```
 config.py        every setting, env-driven
-schema.sql       articles, chunks, story→knowledge links, questions
+schema.sql       articles, chunks, knowledge→story links, questions
+tracing.py       optional LangSmith tracing; a no-op without a key
 db.py            connection, transactions, schema init, article upsert
 loader.py        parses your hand-written chunk JSON; normalises and audits it
 models.py        local bge embeddings + cross-encoder reranker (lazy-loaded)
@@ -75,8 +76,11 @@ The container idles rather than running anything — this is a CLI tool, so you 
 into it. `./data` is bind-mounted, so editing `data/chunks.json` on the host needs
 no rebuild; editing a `.py` file does (`docker compose build`, ~2s from cache).
 
-Model weights live in the `hfcache` named volume, so the ~1.3GB download survives
-`docker compose down` and every rebuild.
+Model weights are **not** in a container-private volume. `HF_HOME` is bind-mounted
+to the host's own HuggingFace cache (`%USERPROFILE%\.cache\huggingface`, or set
+`HF_CACHE_DIR`), so the ~4.6GB for `bge-m3` and its reranker is downloaded once and
+shared with the local venv rather than once per environment. It survives
+`docker compose down` by living outside Docker entirely.
 
 **If you'd rather have a self-contained Postgres**, drop the `networks:` block and
 add a service:
@@ -116,15 +120,20 @@ This parses, normalises and audits without touching the database, loading a mode
 or making an API call. Run it first, every time.
 
 ```
-WARNING loader  repaired 2 trailing comma(s) — the source file is not valid JSON
-WARNING loader  lowercased 5 chunk_type value(s) (e.g. 'Knowledge' -> 'knowledge')
-WARNING loader  chunk 1 ('The Cheesecake Factory Menu') is a story with no links —
-                under knowledge-first retrieval it can never be reached.
+WARNING loader  lowercased 84 chunk_type value(s) (e.g. 'Knowledge' -> 'knowledge')
+INFO    loader  7 link(s) point at a story in a different article — allowed,
+                resolved globally
+WARNING loader  chunk 94 ('On Selling Out — Part 3') is a story that no knowledge
+                chunk points at. Stories are never retrieved directly, so nothing
+                can ever reach it.
 
 The Shift Most Investors Need To Make  (https://…/the-shift-most-investors-need-to-make/)
-  #12    knowledge   22 tok
-  #13    story       34 tok -> [12, 14]
-  #14    knowledge   38 tok
+  #12    knowledge   29 tok -> stories [13]
+  #13    story       59 tok
+  #14    knowledge  365 tok -> stories [13]
+  #19    knowledge  438 tok -> stories [18*]
+
+  * = story in another article
 ```
 
 ## 3. Ingest
@@ -176,10 +185,13 @@ A stream of concatenated JSON objects, one chunk each. Not an array, not strict
 JSONL — objects span multiple lines:
 
 ```json
-{"chunk_id": 13, "title": "...", "source": "https://...", "author": "...",
- "published_at": "2026-06-02", "site": "...", "chunk_type": "story",
- "chunk": "...", "related_knowledge_chunk_ids": [12, 14]}
+{"chunk_id": 2, "title": "...", "source": "https://...", "author": "...",
+ "published_at": "2026-06-02", "site": "...", "chunk_type": "knowledge",
+ "chunk": "...", "related_story_chunk_ids": [1]}
 ```
+
+**Links are declared on the knowledge chunk** and point at the stories that
+illustrate it. A story declares nothing: it is passive, named by whatever cites it.
 
 The loader is deliberately forgiving, because hand-written files drift:
 
@@ -190,20 +202,25 @@ The loader is deliberately forgiving, because hand-written files drift:
 | Trailing commas before `}` | Strips them (outside string literals) and warns |
 | `"Knowledge"` vs `"knowledge"` | Lowercases and warns |
 | `title` / `source` / `published_at` / `chunk` / `chunk_type` | Maps to schema names |
-| `related_knowledge_chunk_ids: 7` or `[7, 9]` | Coerces to a list either way |
+| `related_story_chunk_ids: 7` or `[7, 9]` | Coerces to a list either way |
+| `related_knowledge_chunk_ids` (the old direction) | **Rejects the file**, with a migration note |
+
+That last row is deliberate. Silently ignoring the old key would ingest the whole
+corpus with zero links and no story would ever reach an answer — a failure that
+looks exactly like a retrieval-quality problem.
 
 Your `chunk_id` values are stored as `source_chunk_id`, **not** as the primary key —
-the database assigns its own. Links resolve through a two-pass insert: knowledge
-first, then stories, then links resolved through the id map. So author id 12
-becoming DB id 1000 is handled; nothing silently points at the wrong row.
+the database assigns its own. So author id 12 becoming DB id 1000 is handled;
+nothing silently points at the wrong row.
 
-Links are dropped, with a warning, when the target does not exist, is a story
-rather than knowledge, or lives in a different article.
+**Link resolution is global, not per-article.** Every chunk in the run is inserted
+first, then all links are resolved against one corpus-wide id map, because a
+knowledge chunk may cite a story in a *different* article. The corollary is that
+ingesting only part of a corpus drops any link whose story lives in an article that
+was not in the run — ingest the whole file.
 
-**Story summaries.** A story's embedding is its *summary's* embedding, not its
-text's. Supply `summary` yourself, or the ingester generates one (this is what
-`--no-summaries` turns off, falling back to embedding the story text — at which
-point retrieval matches on narrative wording rather than on the point being made).
+Links are dropped, with a warning naming the chunk id, when the target does not
+exist or is a knowledge chunk rather than a story.
 
 ---
 
@@ -211,45 +228,38 @@ point retrieval matches on narrative wording rather than on the point being made
 
 Story chunks are long, vivid and lexically rich, so they beat the terser knowledge
 chunks in both vector and full-text ranking — exactly the wrong outcome when the
-question asks for the fact. Restricting all three arms to `content_type='knowledge'`
-keeps narrative out of the fusion contest; `attach_stories` then walks the link
-table and hands the model the illustration alongside the fact. The prompt tells the
-model to cite knowledge as `[K1]` and treat stories as illustration only.
+question asks for the fact.
 
-**The trade-off: an unlinked story is unreachable.** It never competes in the arms
-and nothing pulls it in, so it may as well not be indexed. The dry-run audit warns
-about these by chunk id. Two fixes: add `related_knowledge_chunk_ids` to the story,
-or set `STORY_RETRIEVAL_MODE=include` so stories compete directly — which costs some
-knowledge precision, exactly the trade the default avoids.
+So a story is not a retrieval candidate at all. This is structural rather than a
+setting:
+
+- a story row's `embedding` is `NULL`, and a `CHECK` constraint keeps it that way
+- a story row's `search_vector` is `NULL`, so the FTS arm cannot match its text
+- the HQ arm only ever indexes knowledge, so there is nothing to match either
+
+All three arms therefore return knowledge and only knowledge. `attach_stories`
+then walks the link table from whichever knowledge chunks survived reranking and
+hands the model their stories as illustration. The prompt tells the model to cite
+knowledge as `[K1]` and never to cite a story as the source of a fact.
+
+**The consequence: a story nothing cites is unreachable.** There is no mode in
+which it competes on its own merits. The dry-run audit warns about these by chunk
+id; the fix is to add its id to some knowledge chunk's `related_story_chunk_ids`.
 
 Set `ATTACH_LINKED_STORIES=false` to see what pure knowledge retrieval does alone.
 
-### Stories get no hypothetical questions by default
+### Links are many-to-many, and may cross articles
 
-`hq_search` applies the same `content_type` filter as the other two arms, so in
-`knowledge_only` mode a story's questions could never match anything. Generating
-them anyway costs an LLM call plus an embedding per story for permanently
-unreachable rows, so `ingest.py` skips them and says so:
+One knowledge chunk may cite several stories, and one story may be cited by several
+knowledge chunks — including ones in other articles, which is how a single vivid
+anecdote gets reused across a series. `structured_chunk_links` is therefore a join
+table.
 
-```
-INFO ingest  skipping questions for 3 story chunk(s): STORY_RETRIEVAL_MODE=knowledge_only
-             means the HQ arm never sees them
-```
-
-Under `STORY_RETRIEVAL_MODE=include` they are generated, from the story's summary
-rather than its text — the summary is what the story is indexed under.
-
-This is decided at **ingest** time. If you flip to `include` afterwards, the vector
-and FTS arms start reaching stories immediately but the HQ arm stays blind to them
-until you re-ingest; `query.py` prints a warning at startup when it sees that state.
-
-### Links are many-to-many
-
-A story often sits between a setup and its payoff and illustrates both, so
-`structured_chunk_links` is a join table: `"related_knowledge_chunk_ids": [12, 14]`
-stores two rows. When one story attaches to several retrieved knowledge chunks it is
+When one story is cited by several of the retrieved knowledge chunks it is
 de-duplicated to a single context block labelled with every chunk it illustrates
-(`illustrates K1, K3`). The `structured_story_links` view flattens this for psql.
+(`illustrates K1, K3`). `MAX_LINKED_STORIES` caps how many stories each surviving
+knowledge chunk contributes, trimming from the order your JSON listed them in. The
+`structured_story_links` view flattens all of this for psql.
 
 ---
 
@@ -258,11 +268,22 @@ de-duplicated to a single context block labelled with every chunk it illustrates
 Everything is env-driven; `.env.example` has the full list with commentary.
 
 **`EMBED_DIM` must match your embedding model.** It sets the `vector(n)` column
-width at table-creation time. `bge-large-en-v1.5` is 1024; `bge-base` is 768,
-`bge-small` is 384. Changing it means `--reset` and a re-ingest — `ingest.py`
+width at table-creation time. `bge-m3` and `bge-large-en-v1.5` are both 1024;
+`bge-base` is 768, `bge-small` is 384. Changing it means `--reset` and a re-ingest
+— and note that swapping between two models of the *same* dimension still needs a
+re-ingest, because the stored vectors live in the old model's space. `ingest.py`
 checks the model's real output dimension against `EMBED_DIM` before embedding
 anything, and `query.py` checks the column against `EMBED_DIM` at startup, so a
 mismatch fails immediately rather than producing quiet nonsense.
+
+**`EMBED_QUERY_PREFIX` is derived from the model, not defaulted.** bge's v1.5
+English models were trained with a retrieval instruction on the query side
+(`"Represent this sentence for searching relevant passages: "`); **bge-m3 was not**.
+Prepending one anyway adds text the model never saw in training, and the failure is
+silent — retrieval just gets worse, with nothing in the logs. So `config.py` picks
+the prefix from `EMBED_MODEL` and switching models cannot leave the wrong one
+behind. Set `EMBED_QUERY_PREFIX` to override; an empty value is respected as "no
+prefix" rather than falling back to the default.
 
 **Fusion weights.** `WEIGHT_VECTOR` / `WEIGHT_FTS` / `WEIGHT_HQ` scale each arm's
 RRF contribution. FTS starts at 0.8 because `ts_rank_cd` rewards term repetition,
@@ -276,8 +297,8 @@ order rather than failing the request.
 
 **Reasoning models.** `openai/gpt-oss-*` spends the token budget on a hidden
 reasoning channel before writing any content. At the default effort it exhausts
-`LLM_MAX_TOKENS` and returns `content=''` with `finish_reason='length'` — an empty
-summary or a blank answer, with nothing saying why. `GROQ_REASONING_EFFORT=low`
+`LLM_MAX_TOKENS` and returns `content=''` with `finish_reason='length'` — a blank
+answer or a chunk with no questions, with nothing saying why. `GROQ_REASONING_EFFORT=low`
 (the default here, and applied only to `gpt-oss` models) leaves room for an answer,
 and `llm.py` raises a specific error rather than returning the empty string if it
 still happens. A non-reasoning model like `llama-3.3-70b-versatile` sidesteps this
@@ -300,11 +321,53 @@ changes which model wrote your data.
 
 ---
 
+## Tracing with LangSmith
+
+Optional, and off unless you set a key. There is no LangChain here — `tracing.py`
+wraps the bare `langsmith` SDK and resolves each decorator **once at import time**:
+with no key, `@traceable` is the identity function and the pipeline pays nothing at
+call time.
+
+```bash
+pip install langsmith
+# .env
+LANGSMITH_API_KEY=lsv2_pt_...
+LANGSMITH_PROJECT=hf-demo-rag
+```
+
+One call to `query.run` becomes one trace tree:
+
+```
+structured_rag                       chain
+├── embed_query                      embedding   (logs dimensions, not 1024 floats)
+├── vector_search                    retriever
+├── fts_search                       retriever
+├── hq_search                        retriever
+├── rerank                           chain       candidates_in / kept
+├── linked_stories                   retriever
+└── groq.chat                        llm         model, attempts, tokens, finish_reason
+```
+
+The root run carries the numbers worth filtering on later: hits per arm, the
+surviving `knowledge_chunk_ids` and `story_chunk_ids`, context size, and per-stage
+milliseconds. `groq.chat` records the model that **actually** answered, which is
+not always the one asked for — a non-429 failure falls back.
+
+Ingestion traces too, as `ingest` with a `hypothetical_questions` child.
+
+Tracing can never fail a query. A missing package, a bad key or an unreachable
+endpoint degrades to warnings in the log; the answer still comes back. Set
+`LANGSMITH_TRACING=false` to switch it off while leaving the key in place.
+
+Because CLI runs are short-lived and traces are batched on a background thread,
+`ingest.py` and `query.py` both call `tracing.flush()` on the way out.
+
+---
+
 ## Tuning notes
 
 - **HQ coverage is the usual weak spot.** `HQ_PER_CHUNK=3` is thin for dense
-  chunks. Check `questions / knowledge_chunks` in `--stats` (`story_questions` is
-  0 unless you ingested in `include` mode); if the `hq` arm
+  chunks. Check `questions / knowledge_chunks` in `--stats`; if the `hq` arm
   contributes near nothing on real questions, your generated questions aren't
   covering the angles users actually ask from — raise `HQ_PER_CHUNK` or rewrite
   `HQ_SYSTEM` in `prompts.py`.

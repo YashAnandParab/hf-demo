@@ -15,7 +15,11 @@ services:
       HF_HOME: /app/.hfcache
     volumes:
       - ./data:/app/data
-      - hfcache:/app/.hfcache
+      # The HOST HuggingFace cache, shared rather than duplicated. bge-m3 plus its
+      # reranker is ~4.6GB; a container-private volume would download a second copy
+      # of weights the local venv already has. Override with HF_CACHE_DIR if your
+      # cache lives elsewhere.
+      - ${HF_CACHE_DIR:-${USERPROFILE}/.cache/huggingface}:/app/.hfcache
     networks:
       - postgres
     command: sleep infinity
@@ -30,7 +34,10 @@ networks:
     external: true
     name: postgress_default
 
-volumes:
-  # ~1.3GB of embedding + reranker weights. Named so the download survives
-  # `docker compose down` and every image rebuild.
-  hfcache:
+# No named volume for the model cache any more — the host cache is bind-mounted
+# above, so weights survive `docker compose down` by virtue of living outside
+# Docker entirely. If you would rather keep the container isolated, swap that line
+# back to `hfcache:/app/.hfcache` and restore:
+#
+# volumes:
+#   hfcache:

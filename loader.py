@@ -2,14 +2,24 @@
 
 The input format is a stream of concatenated JSON objects, one chunk each:
 
-    {"chunk_id": 1, "title": "...", "source": "https://...", "author": "...",
+    {"chunk_id": 2, "title": "...", "source": "https://...", "author": "...",
      "published_at": "2025-08-19", "clipped_at": "...", "site": "...",
-     "chunk_type": "story", "chunk": "...",
-     "related_knowledge_chunk_ids": [12, 14]}
+     "chunk_type": "knowledge", "chunk": "...",
+     "related_story_chunk_ids": [1]}
 
 That is neither a JSON array nor strict JSONL (objects span multiple lines), and
 hand-written files pick up trailing commas. This module parses it anyway, repairs
 what is safely repairable, and reports everything it had to touch.
+
+Links are declared on the KNOWLEDGE chunk and point at the stories that
+illustrate it. A story never declares anything and is never retrieved on its own
+merits — it reaches the model only by being attached to a knowledge chunk that
+survived reranking. Files written the other way round (a story declaring
+`related_knowledge_chunk_ids`) are detected and rejected with a migration note
+rather than silently losing every link.
+
+A link may cross articles: a knowledge chunk in one article can point at a story
+in another, so link resolution at ingest time is global rather than per-article.
 
 Normalisation applied:
     title        -> article_name
@@ -18,7 +28,7 @@ Normalisation applied:
     chunk        -> chunk_text
     chunk_type   -> content_type   (lowercased; "Knowledge" -> "knowledge")
     chunk_id     -> source_chunk_id
-    related_knowledge_chunk_ids -> links (always a list, even when given as an int)
+    related_story_chunk_ids -> links (always a list, even when given as an int)
 
 Nothing here touches the database or an API, so `ingest.py --dry-run` can run the
 whole parse-and-audit pass for free.
@@ -50,15 +60,20 @@ _FIELD_ALIASES = {
     "author": "author",
     "site": "site",
     "clipped_at": "clipped_at",
-    "summary": "story_summary",
-    "story_summary": "story_summary",
 }
 
 _LINK_KEYS = (
+    "related_story_chunk_ids",
+    "related_story_chunk_id",
+    "related_story_ids",
+    "related_stories",
+)
+
+# The pre-inversion format. Recognised only so the failure is a clear message
+# instead of an ingest that quietly produces zero links.
+_LEGACY_LINK_KEYS = (
     "related_knowledge_chunk_ids",
     "related_knowledge_chunk_id",
-    "related_chunk_ids",
-    "related_chunk_id",
 )
 
 
@@ -72,7 +87,6 @@ class RawChunk:
     site: str | None
     content_type: str
     chunk_text: str
-    story_summary: str | None
     links: list[int]
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
@@ -82,6 +96,8 @@ class LoadReport:
     objects_parsed: int = 0
     trailing_commas_repaired: int = 0
     content_type_normalised: int = 0
+    legacy_link_keys: int = 0
+    cross_article_links: int = 0
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -96,6 +112,11 @@ class LoadReport:
             log.warning(
                 "lowercased %d chunk_type value(s) (e.g. 'Knowledge' -> 'knowledge')",
                 self.content_type_normalised,
+            )
+        if self.cross_article_links:
+            log.info(
+                "%d link(s) point at a story in a different article — allowed, resolved globally",
+                self.cross_article_links,
             )
         for w in self.warnings:
             log.warning("%s", w)
@@ -192,6 +213,16 @@ def parse_objects(text: str, report: LoadReport) -> list[dict]:
 
 
 def _extract_links(obj: dict, report: LoadReport, chunk_id) -> list[int]:
+    for key in _LEGACY_LINK_KEYS:
+        if key in obj and obj[key]:
+            report.legacy_link_keys += 1
+            report.errors.append(
+                f"chunk {chunk_id}: uses '{key}'. Links are now declared on the KNOWLEDGE "
+                f"chunk as 'related_story_chunk_ids' pointing at its stories. This file is "
+                f"in the old story->knowledge format and would ingest with no links at all."
+            )
+            return []
+
     for key in _LINK_KEYS:
         if key not in obj:
             continue
@@ -248,10 +279,10 @@ def normalise(obj: dict, report: LoadReport) -> RawChunk | None:
         source_chunk_id = None
 
     links = _extract_links(obj, report, chunk_id)
-    if links and content_type == "knowledge":
+    if links and content_type == "story":
         report.warnings.append(
-            f"chunk {chunk_id}: knowledge chunk declares links; ignored "
-            f"(links are declared on stories)"
+            f"chunk {chunk_id}: story chunk declares links; ignored "
+            f"(links are declared on knowledge chunks and point at stories)"
         )
         links = []
 
@@ -264,7 +295,6 @@ def normalise(obj: dict, report: LoadReport) -> RawChunk | None:
         site=(mapped.get("site") or None),
         content_type=content_type,
         chunk_text=text,
-        story_summary=(mapped.get("story_summary") or None),
         links=links,
         raw=obj,
     )
@@ -303,6 +333,10 @@ def group_by_article(chunks: list[RawChunk]) -> dict[str, list[RawChunk]]:
     return groups
 
 
+def _article_key(chunk: RawChunk) -> str:
+    return chunk.article_url or f"title::{chunk.article_name}"
+
+
 def audit(chunks: list[RawChunk], report: LoadReport) -> None:
     """Warn about links and stories that will not behave as expected."""
     by_id = {c.source_chunk_id: c for c in chunks if c.source_chunk_id is not None}
@@ -322,28 +356,32 @@ def audit(chunks: list[RawChunk], report: LoadReport) -> None:
                 report.warnings.append(
                     f"chunk {chunk.source_chunk_id}: link to {target} — no such chunk_id, dropped"
                 )
-            elif other.content_type != "knowledge":
+            elif other.content_type != "story":
                 report.warnings.append(
                     f"chunk {chunk.source_chunk_id}: link to {target} which is a "
-                    f"'{other.content_type}' chunk, not knowledge — dropped"
+                    f"'{other.content_type}' chunk, not a story — dropped"
                 )
-            elif (other.article_url or other.article_name) != (
-                chunk.article_url or chunk.article_name
-            ):
-                report.warnings.append(
-                    f"chunk {chunk.source_chunk_id}: link to {target} crosses articles — dropped"
-                )
+            elif _article_key(other) != _article_key(chunk):
+                # Allowed: a knowledge chunk may borrow a story from another article.
+                report.cross_article_links += 1
 
-    linked_knowledge = {t for c in chunks if c.content_type == "story" for t in c.links}
+    # A story is reachable only by being pointed at. Nothing else can retrieve it.
+    referenced = {
+        t for c in chunks if c.content_type == "knowledge" for t in c.links
+    }
     for chunk in chunks:
-        if chunk.content_type == "story" and not chunk.links:
+        if chunk.content_type != "story":
+            continue
+        if chunk.source_chunk_id is None or chunk.source_chunk_id not in referenced:
             report.warnings.append(
-                f"chunk {chunk.source_chunk_id} ('{chunk.article_name[:40]}') is a story with no "
-                f"links — under knowledge-first retrieval it can never be reached. "
-                f"Add related_knowledge_chunk_ids, or set STORY_RETRIEVAL_MODE=include."
+                f"chunk {chunk.source_chunk_id} ('{chunk.article_name[:40]}') is a story that no "
+                f"knowledge chunk points at. Stories are never retrieved directly, so nothing "
+                f"can ever reach it — add its id to a knowledge chunk's related_story_chunk_ids."
             )
-    if linked_knowledge:
-        log.info("%d knowledge chunk(s) have at least one story attached", len(linked_knowledge))
+
+    with_stories = sum(1 for c in chunks if c.content_type == "knowledge" and c.links)
+    if with_stories:
+        log.info("%d knowledge chunk(s) have at least one story attached", with_stories)
 
 
 # --------------------------------------------------------------------------- #

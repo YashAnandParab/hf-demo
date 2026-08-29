@@ -4,12 +4,14 @@
     python ingest.py data/chunks.json --dry-run     # parse + audit, writes nothing
     python ingest.py data/chunks.json --reset       # drop the tables first
 
-Ordering is two-pass, because a story's links point at knowledge chunks that must
-exist before they can be referenced:
+Ordering is two-pass and GLOBAL, not per-article:
 
-    1. insert all knowledge chunks, recording source_chunk_id -> db chunk_id
-    2. insert all story chunks
-    3. resolve links through that map into structured_chunk_links
+    1. insert every chunk of every article, recording source_chunk_id -> db chunk_id
+    2. resolve all knowledge -> story links through that one map
+
+It has to be global because a knowledge chunk may cite a story in a different
+article. Resolving links inside each article group, as an earlier version did,
+would silently drop exactly those links.
 
 Your hand-assigned `chunk_id` is stored as `source_chunk_id`, never as the primary
 key — the database assigns its own. So author id 12 becoming DB id 1000 is handled,
@@ -17,9 +19,16 @@ and nothing silently points at the wrong row.
 
 Embedding rule:
     knowledge -> embed chunk_text
-    story     -> embed story_summary  (generated if absent; falls back to the text)
+    story     -> no embedding at all
+
+A story is not a retrieval candidate under any setting: it reaches the model only
+by being cited by a knowledge chunk that survived reranking. Embedding one would
+cost time and space for a vector nothing queries, so the column is left NULL and
+the schema enforces it.
 
 Re-ingesting an article deletes its existing chunks first, so this is idempotent.
+Note that re-ingesting only PART of a corpus will drop cross-article links whose
+story lives in an article that was not part of this run — ingest the whole file.
 """
 from __future__ import annotations
 
@@ -29,7 +38,7 @@ import sys
 from pathlib import Path
 
 import config
-import prompts
+import tracing
 from loader import RawChunk, audit, count_tokens, group_by_article, load_chunks
 
 # db / models / llm are imported inside the functions that need them, so that
@@ -40,194 +49,135 @@ log = logging.getLogger("ingest")
 _INSERT_CHUNK_SQL = """
     INSERT INTO structured_chunks
         (article_id, source_chunk_id, chunk_index, chunk_text,
-         content_type, story_summary, token_count, embedding)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector)
+         content_type, token_count, embedding)
+    VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
     RETURNING chunk_id
 """
 
 
-def summarise_story(story_text: str, knowledge_context: str) -> str:
-    from llm import chat
-
-    try:
-        return chat(
-            prompts.SUMMARY_SYSTEM,
-            prompts.build_summary_prompt(story_text, knowledge_context),
-            max_tokens=300,
-        ).strip()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("summary generation failed: %s", exc)
-        return ""
-
-
-def ingest_group(chunks: list[RawChunk], *, summarise: bool, with_questions: bool) -> dict:
+@tracing.traceable(run_type="chain", name="ingest")
+def ingest_all(groups: dict[str, list[RawChunk]], *, with_questions: bool) -> dict:
+    """Insert every article, then resolve every link across all of them."""
     import db
     import models
 
-    # keep the author's own ordering; chunks without an id go last
-    chunks = sorted(chunks, key=lambda c: (c.source_chunk_id is None, c.source_chunk_id or 0))
-    head = chunks[0]
-
-    article_id = db.upsert_article(
-        article_name=head.article_name,
-        full_text="\n\n".join(c.chunk_text for c in chunks),
-        article_url=head.article_url,
-        author=head.author,
-        published_date=head.published_date,
-        site=head.site,
-    )
-    with db.cursor() as cur:
-        cur.execute("DELETE FROM structured_chunks WHERE article_id = %s", (article_id,))
-
-    knowledge = [c for c in chunks if c.content_type == "knowledge"]
-    stories = [c for c in chunks if c.content_type == "story"]
-    by_source_id = {c.source_chunk_id: c for c in chunks if c.source_chunk_id is not None}
-
-    # ---- story summaries -------------------------------------------------
-    # A story's embedding is its summary's embedding. Where no summary was
-    # supplied, generate one from the story plus the knowledge it illustrates.
-    for story in stories:
-        if story.story_summary or not summarise:
-            continue
-        context = " ".join(by_source_id[t].chunk_text for t in story.links if t in by_source_id)
-        story.story_summary = summarise_story(story.chunk_text, context) or None
-
-    without_summary = sum(1 for s in stories if not s.story_summary)
-    if without_summary:
-        log.warning(
-            "%d story chunk(s) have no summary; embedding their full text instead "
-            "(retrieval will match on narrative wording, not on the point they make)",
-            without_summary,
+    # ---- articles, and the per-article chunk ordering --------------------
+    prepared: list[tuple[int, list[RawChunk]]] = []
+    for group in groups.values():
+        # keep the author's own ordering; chunks without an id go last
+        chunks = sorted(group, key=lambda c: (c.source_chunk_id is None, c.source_chunk_id or 0))
+        head = chunks[0]
+        article_id = db.upsert_article(
+            article_name=head.article_name,
+            full_text="\n\n".join(c.chunk_text for c in chunks),
+            article_url=head.article_url,
+            author=head.author,
+            published_date=head.published_date,
+            site=head.site,
         )
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM structured_chunks WHERE article_id = %s", (article_id,))
+        prepared.append((article_id, chunks))
 
-    # ---- embeddings ------------------------------------------------------
-    k_texts = [c.chunk_text for c in knowledge]
-    s_texts = [c.story_summary or c.chunk_text for c in stories]
-    vectors = models.embed_documents(k_texts + s_texts)
-    k_vectors = vectors[: len(k_texts)]
-    s_vectors = vectors[len(k_texts) :]
+    # ---- embeddings: knowledge only, one batch for the whole corpus ------
+    # Iterated in exactly the order the insert loop below will hit them, so the
+    # vectors line up without needing a key.
+    knowledge = [c for _, chunks in prepared for c in chunks if c.content_type == "knowledge"]
+    stories = [c for _, chunks in prepared for c in chunks if c.content_type == "story"]
+    log.info("embedding %d knowledge chunk(s); %d story chunk(s) are not embedded",
+             len(knowledge), len(stories))
+    vectors = iter(models.embed_documents([c.chunk_text for c in knowledge]))
 
+    # ---- pass 1: insert every chunk --------------------------------------
     source_to_db: dict[int, int] = {}
-    link_rows: list[tuple[int, int, int]] = []
-    chunk_index = 0
+    inserted: list[tuple[RawChunk, int]] = []
 
     with db.cursor() as cur:
-        # ---- pass 1: knowledge -------------------------------------------
-        for chunk, vector in zip(knowledge, k_vectors):
-            cur.execute(
-                _INSERT_CHUNK_SQL,
-                (
-                    article_id,
-                    chunk.source_chunk_id,
-                    chunk_index,
-                    chunk.chunk_text,
-                    "knowledge",
-                    None,
-                    count_tokens(chunk.chunk_text),
-                    db.to_pgvector(vector),
-                ),
-            )
-            db_id = int(cur.fetchone()["chunk_id"])
-            if chunk.source_chunk_id is not None:
-                source_to_db[chunk.source_chunk_id] = db_id
-            chunk_index += 1
+        for article_id, chunks in prepared:
+            for chunk_index, chunk in enumerate(chunks):
+                is_knowledge = chunk.content_type == "knowledge"
+                cur.execute(
+                    _INSERT_CHUNK_SQL,
+                    (
+                        article_id,
+                        chunk.source_chunk_id,
+                        chunk_index,
+                        chunk.chunk_text,
+                        chunk.content_type,
+                        count_tokens(chunk.chunk_text),
+                        db.to_pgvector(next(vectors)) if is_knowledge else None,
+                    ),
+                )
+                db_id = int(cur.fetchone()["chunk_id"])
+                inserted.append((chunk, db_id))
+                if chunk.source_chunk_id is not None:
+                    if chunk.source_chunk_id in source_to_db:
+                        log.warning(
+                            "chunk_id %s appears more than once across the corpus; links to it "
+                            "will resolve to the last one inserted",
+                            chunk.source_chunk_id,
+                        )
+                    source_to_db[chunk.source_chunk_id] = db_id
 
-        # ---- pass 2: stories, now that knowledge ids exist ----------------
-        story_db_ids: list[int] = []
-        for chunk, vector in zip(stories, s_vectors):
-            cur.execute(
-                _INSERT_CHUNK_SQL,
-                (
-                    article_id,
-                    chunk.source_chunk_id,
-                    chunk_index,
-                    chunk.chunk_text,
-                    "story",
-                    chunk.story_summary,
-                    count_tokens(chunk.chunk_text),
-                    db.to_pgvector(vector),
-                ),
-            )
-            db_id = int(cur.fetchone()["chunk_id"])
-            story_db_ids.append(db_id)
-            if chunk.source_chunk_id is not None:
-                source_to_db[chunk.source_chunk_id] = db_id
-            chunk_index += 1
+    # ---- pass 2: links, now that every id in the corpus is known ---------
+    by_source = {c.source_chunk_id: c for c, _ in inserted if c.source_chunk_id is not None}
+    link_rows: list[tuple[int, int, int]] = []
+    dropped = 0
 
-        # ---- pass 3: links -----------------------------------------------
-        dropped = 0
-        for chunk, db_id in zip(stories, story_db_ids):
-            for position, target in enumerate(chunk.links):
-                target_db = source_to_db.get(target)
-                target_raw = by_source_id.get(target)
-                if target_db is None or target_raw is None or target_raw.content_type != "knowledge":
-                    dropped += 1
-                    continue
-                link_rows.append((db_id, target_db, position))
-        if link_rows:
+    for chunk, db_id in inserted:
+        if chunk.content_type != "knowledge":
+            continue
+        for position, target in enumerate(chunk.links):
+            target_db = source_to_db.get(target)
+            target_raw = by_source.get(target)
+            if target_db is None or target_raw is None or target_raw.content_type != "story":
+                dropped += 1
+                continue
+            link_rows.append((db_id, target_db, position))
+
+    if link_rows:
+        with db.cursor() as cur:
             cur.executemany(
                 """
-                INSERT INTO structured_chunk_links (story_chunk_id, knowledge_chunk_id, position)
+                INSERT INTO structured_chunk_links (knowledge_chunk_id, story_chunk_id, position)
                 VALUES (%s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
                 link_rows,
             )
-        if dropped:
-            log.warning("dropped %d unresolvable link(s) in '%s'", dropped, head.article_name[:50])
+    if dropped:
+        log.warning("dropped %d unresolvable link(s) — see the loader warnings above", dropped)
 
+    # ---- pass 3: hypothetical questions ----------------------------------
     question_count = 0
     if with_questions and config.HQ_ENABLED:
-        question_count = ingest_questions(knowledge, stories, source_to_db)
+        question_count = ingest_questions(
+            [(db_id, c.chunk_text) for c, db_id in inserted if c.content_type == "knowledge"]
+        )
 
-    log.info(
-        "article %s '%s': %d knowledge, %d story, %d links, %d questions",
-        article_id, head.article_name[:50], len(knowledge), len(stories), len(link_rows), question_count,
-    )
-    return {
-        "article_id": article_id,
+    totals = {
+        "articles": len(prepared),
         "knowledge": len(knowledge),
         "stories": len(stories),
         "links": len(link_rows),
         "questions": question_count,
     }
+    tracing.add_metadata(**totals, dropped_links=dropped)
+    return totals
 
 
-def ingest_questions(
-    knowledge: list[RawChunk], stories: list[RawChunk], source_to_db: dict[int, int]
-) -> int:
-    """Generate hypothetical questions for the chunks the HQ arm can actually reach.
+@tracing.traceable(run_type="chain", name="hypothetical_questions")
+def ingest_questions(targets: list[tuple[int, str]]) -> int:
+    """Generate hypothetical questions for knowledge chunks.
 
-    `hq_search` applies the same content_type filter as the other two arms, so under
-    the default STORY_RETRIEVAL_MODE=knowledge_only a story's questions could never
-    match anything — generating them costs one LLM call plus an embedding per story
-    for rows nothing can retrieve. So stories only get questions in `include` mode,
-    where they compete in the arms directly.
+    Only knowledge chunks get them: the HQ arm is a retrieval arm, and a story is
+    never a retrieval candidate, so questions written for one could not match
+    anything. Generating them would cost an LLM call plus an embedding per story
+    for rows nothing can reach.
     """
     import db
     import hq
     import models
-
-    targets: list[tuple[int, str]] = []
-    for chunk in knowledge:
-        db_id = source_to_db.get(chunk.source_chunk_id)
-        if db_id:
-            targets.append((db_id, chunk.chunk_text))
-
-    stories_included = config.STORY_RETRIEVAL_MODE == "include"
-    if stories_included:
-        # a story is indexed under its summary, so that is what it should be asked about
-        for chunk in stories:
-            db_id = source_to_db.get(chunk.source_chunk_id)
-            if db_id:
-                targets.append((db_id, chunk.story_summary or chunk.chunk_text))
-    elif stories:
-        log.info(
-            "skipping questions for %d story chunk(s): STORY_RETRIEVAL_MODE=%s means the "
-            "HQ arm never sees them",
-            len(stories),
-            config.STORY_RETRIEVAL_MODE,
-        )
 
     if not targets:
         return 0
@@ -260,16 +210,27 @@ def ingest_questions(
 
 def print_dry_run(groups: dict[str, list[RawChunk]], report) -> None:
     print("\n--- dry run, nothing written ---")
+    home = {
+        c.source_chunk_id: (c.article_url or c.article_name)
+        for group in groups.values()
+        for c in group
+    }
     for key, group in groups.items():
         head = group[0]
         print(f"\n{head.article_name}  ({key})")
         for c in sorted(group, key=lambda c: c.source_chunk_id or 0):
-            links = f" -> {c.links}" if c.links else ""
-            summary = "  [has summary]" if c.story_summary else ""
+            # mark links whose story lives in another article — they only resolve
+            # because link resolution is global
+            marks = [
+                f"{t}*" if home.get(t) not in (None, c.article_url or c.article_name) else str(t)
+                for t in c.links
+            ]
+            links = f" -> stories [{', '.join(marks)}]" if marks else ""
             print(
                 f"  #{str(c.source_chunk_id):<5} {c.content_type:<9} "
-                f"{count_tokens(c.chunk_text):>4} tok{links}{summary}"
+                f"{count_tokens(c.chunk_text):>4} tok{links}"
             )
+    print("\n  * = story in another article")
     if report.errors:
         print(f"\n{len(report.errors)} error(s) — fix these before ingesting.")
 
@@ -293,11 +254,6 @@ def main() -> None:
         help="parse, normalise and audit only — no database writes, no model loading",
     )
     parser.add_argument("--reset", action="store_true", help="DROP and recreate all tables first")
-    parser.add_argument(
-        "--no-summaries",
-        action="store_true",
-        help="do not generate story summaries; embed the story text directly",
-    )
     parser.add_argument("--no-questions", action="store_true", help="skip hypothetical questions")
     args = parser.parse_args()
 
@@ -313,6 +269,12 @@ def main() -> None:
 
     if not chunks:
         raise SystemExit("no usable chunks found — see the errors above")
+    if report.legacy_link_keys:
+        raise SystemExit(
+            f"{report.legacy_link_keys} chunk(s) still declare 'related_knowledge_chunk_ids'. "
+            f"Links now live on the knowledge chunk as 'related_story_chunk_ids'; ingesting "
+            f"this file would produce no links at all."
+        )
 
     groups = group_by_article(chunks)
     log.info(
@@ -335,6 +297,7 @@ def main() -> None:
     if args.reset:
         db.reset_schema()
     else:
+        db.check_schema_version()
         db.init_schema()
         db.check_embed_dim()
 
@@ -346,20 +309,12 @@ def main() -> None:
             f"{config.EMBED_DIM}. Set EMBED_DIM={actual_dim} and re-run with --reset."
         )
 
-    totals = {"articles": 0, "knowledge": 0, "stories": 0, "links": 0, "questions": 0}
-    for group in groups.values():
-        result = ingest_group(
-            group,
-            summarise=not args.no_summaries,
-            with_questions=not args.no_questions,
-        )
-        totals["articles"] += 1
-        for key in ("knowledge", "stories", "links", "questions"):
-            totals[key] += result[key]
+    totals = ingest_all(groups, with_questions=not args.no_questions)
 
     log.info(
         "done: %d articles, %d knowledge, %d story, %d links, %d questions",
-        totals["articles"], totals["knowledge"], totals["stories"], totals["links"], totals["questions"],
+        totals["articles"], totals["knowledge"], totals["stories"],
+        totals["links"], totals["questions"],
     )
 
     counts = retrieval.stats()
@@ -368,8 +323,8 @@ def main() -> None:
         print(f"  {key:<20} {value}")
     if counts["orphan_stories"]:
         print(
-            "\n  note: orphan stories have no link to any knowledge chunk, so under the\n"
-            "  default knowledge-first retrieval nothing will ever pull them in."
+            "\n  note: orphan stories are cited by no knowledge chunk. Stories are never\n"
+            "  retrieved directly, so nothing can ever pull them into an answer."
         )
 
 
@@ -379,5 +334,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     finally:
+        tracing.flush()
         if "db" in sys.modules:
             sys.modules["db"].close()

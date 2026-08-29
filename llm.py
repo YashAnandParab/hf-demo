@@ -16,6 +16,7 @@ import time
 from functools import lru_cache
 
 import config
+import tracing
 
 log = logging.getLogger("llm")
 
@@ -31,6 +32,7 @@ def _client():
     return Groq(api_key=config.GROQ_API_KEY)
 
 
+@tracing.traceable(run_type="llm", name="groq.chat")
 def chat(
     system: str,
     user: str,
@@ -83,7 +85,7 @@ def _abort_if_fatal(exc: Exception) -> None:
         f"  In Docker, .env is read when the container is CREATED. After editing it:\n"
         f"      docker compose up -d --force-recreate\n"
         f"  To ingest without any LLM calls at all:\n"
-        f"      python ingest.py data/chunks.json --no-summaries --no-questions"
+        f"      python ingest.py data/chunks.json --no-questions"
     )
 
 
@@ -103,6 +105,26 @@ def _complete(model: str, system: str, user: str, kwargs: dict) -> str:
             content = (choice.message.content or "").strip()
             if not content:
                 raise RuntimeError(_empty_content_reason(model, choice, kwargs))
+            # `_complete` is not itself traced, so this lands on the `chat` run —
+            # which is the one that should say which model actually answered, since
+            # a fallback means that is not the model the caller asked for.
+            #
+            # Token counts must go under the literal key `usage_metadata`, with
+            # LangSmith's own field names: its _extract_usage() reads only that key
+            # and ignores everything else. Logging Groq's prompt_tokens /
+            # completion_tokens as plain metadata shows the numbers on the run but
+            # leaves the token and cost panels empty, which looks like the API
+            # returned no usage at all.
+            usage = getattr(response, "usage", None)
+            tracing.add_metadata(
+                model=model,
+                attempts=attempt + 1,
+                finish_reason=choice.finish_reason,
+                # ls_provider / ls_model_name are what LangSmith prices the run on
+                ls_provider="groq",
+                ls_model_name=model,
+                usage_metadata=_usage_metadata(usage),
+            )
             return content
         except Exception as exc:  # noqa: BLE001
             wait = _rate_limit_wait(exc)
@@ -115,6 +137,23 @@ def _complete(model: str, system: str, user: str, kwargs: dict) -> str:
             )
             time.sleep(wait)
     raise RuntimeError(f"{model}: still rate limited after {config.LLM_MAX_RETRIES} attempts") from last
+
+
+def _usage_metadata(usage) -> dict | None:
+    """Groq's usage object in the shape LangSmith prices runs from.
+
+    Returns None when the response carried no usage, so the key is simply absent
+    rather than present-but-zero — a zero would read as "this call was free".
+    """
+    if usage is None:
+        return None
+    fields = {
+        "input_tokens": getattr(usage, "prompt_tokens", None),
+        "output_tokens": getattr(usage, "completion_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+    }
+    present = {k: int(v) for k, v in fields.items() if v is not None}
+    return present or None
 
 
 def _empty_content_reason(model: str, choice, kwargs: dict) -> str:
