@@ -25,8 +25,9 @@ __pycache__/
 # directory once you're sure you don't want it back.
 _archive/
 
-# Editor / OS
+# Editor / OS / tooling caches
 .vscode/
+.serena/
 .idea/
 *.swp
 .DS_Store

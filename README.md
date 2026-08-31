@@ -5,7 +5,9 @@ is the narrative that illustrates it. Only knowledge competes in retrieval — t
 stories that illustrate the surviving knowledge are attached afterwards through a
 link table, and handed to the model as illustration rather than as evidence.
 
-Plain Python scripts and a Postgres you already have. No Docker, no web server.
+Plain Python scripts and a Postgres you already have. A chat UI is optional:
+`api.py` puts the same pipeline behind two HTTP endpoints for the React app in
+[frontend/](frontend/).
 
 ```
 embed ─┬─ vector_search ─┐
@@ -70,7 +72,10 @@ retrieval.py     the three arms, the story link walk, /stats
 prompts.py       system prompts and context formatting, for both versions
 ingest.py        JSON  → database
 query.py         question → answer, every stage printed
+api.py           the same pipeline behind GET /models and POST /chat (SSE)
+frontend/        React chat UI; the model picker switches version
 test_loader.py   offline tests: no db, no models, no API key
+test_api.py      offline tests for the HTTP mapping
 data/chunks.json          your chunks
 data/chunks_normal.json   generated: the same chunks, stripped of structure
 tools/make_normal_chunks.py  regenerates the above
@@ -149,6 +154,20 @@ Point it at a Postgres with the `vector` extension available. Set `POSTGRES_HOST
 `POSTGRES_PORT` / credentials in `.env`, or give it a full `DATABASE_URL`. When the
 database is in Docker, `POSTGRES_PORT` is the **host** mapping (often 5433), not
 5432 — that difference is the single most common cause of "connection refused".
+
+Have no pgvector server yet? One container, no compose file:
+
+```bash
+docker run -d --name rag-postgres \
+  -e POSTGRES_PASSWORD=<the one in your .env> \
+  -p 5433:5432 -v rag-pgdata:/var/lib/postgresql/data \
+  pgvector/pgvector:pg17
+```
+
+Then `POSTGRES_PORT=5433`. Do **not** leave it at 5432 if you have a native
+PostgreSQL service installed: that service answers on 5432 and rejects the
+container's password, so the error reads "password authentication failed" when the
+real problem is the port.
 
 ## 2. Check your chunk file before spending anything
 
@@ -232,6 +251,30 @@ psql -h localhost -U postgres -d normal_chunking
 \d normal_chunks
 SELECT count(*) FROM normal_chunks;            -- all of them retrievable
 ```
+
+## 6. Ask in a browser
+
+`api.py` is the same pipeline behind two endpoints, and `frontend/` is a React
+chat client for it. Two terminals:
+
+```bash
+uvicorn api:app --port 8000            # loads the models, then serves
+cd frontend && npm install && npm run dev
+```
+
+Open <http://localhost:5173>. The picker in the composer lists the two **versions**,
+not two LLMs: choosing one switches the database the answer is retrieved from.
+Which LLM writes it stays `GROQ_MODEL`, the same for both, so a difference between
+two answers is still attributable to the structure.
+
+Startup loads bge-m3 and the reranker before binding, so the first question is fast
+and the ~30s wait is visible in the log rather than looking like a hung request.
+The pipeline is process-wide state — one connection, one active version, one
+resident model pair — so a lock serialises requests; this is a single-user demo
+server, not a service.
+
+`GET /models` lists the versions, `POST /chat` streams `sources` then answer tokens
+as SSE. See [frontend/README.md](frontend/README.md) for the exact wire format.
 
 ---
 
@@ -369,8 +412,10 @@ reasoning channel before writing any content. At the default effort it exhausts
 answer or a chunk with no questions, with nothing saying why. `GROQ_REASONING_EFFORT=low`
 (the default here, and applied only to `gpt-oss` models) leaves room for an answer,
 and `llm.py` raises a specific error rather than returning the empty string if it
-still happens. A non-reasoning model like `llama-3.3-70b-versatile` sidesteps this
-entirely and is plenty for summaries and question generation.
+still happens. A non-reasoning model sidesteps this entirely and is plenty for
+summaries and question generation — but check one is still on your key first: Groq
+retires models, and a retired id 404s on the fallback too, so the run fails rather
+than degrades. The Llama models this project originally defaulted to are gone.
 
 **Auth failures stop the run.** A 401/403 fails identically on every model, so
 falling back would just double the doomed requests and bury the cause under a wall
@@ -448,11 +493,14 @@ Because CLI runs are short-lived and traces are batched on a background thread,
 ## Tests
 
 ```bash
-pytest -q test_loader.py
+pytest -q test_loader.py test_api.py
+cd frontend && npm run check       # SSE framing, in node
 ```
 
-18 tests covering the parser, the field normalisation, the link audit, the two-pass
-id resolution, and RRF fusion. No database, no models, no API key.
+`test_loader.py` is 18 tests covering the parser, the field normalisation, the link
+audit, the two-pass id resolution, and RRF fusion. `test_api.py` covers the HTTP
+mapping — the score squash, and that a source's `id` is exactly the label the
+prompt tells the model to cite. No database, no models, no API key.
 
 ## Notes
 

@@ -33,6 +33,7 @@ below as a child run.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 
@@ -50,6 +51,20 @@ RULE = "=" * 78
 THIN = "-" * 78
 
 
+def normalized_score(hit: dict) -> float:
+    """One 0..1 relevance number per hit, for the similarity floor and the API.
+
+    The cross-encoder returns a logit (roughly -11..+11), which is neither
+    comparable to a fusion score nor meaningful to a slider; a sigmoid squashes it
+    into the 0..1 range fusion already lives in. Hits that never reached the
+    reranker keep their fusion score, which is already small and positive.
+    """
+    score = hit.get("rerank_score")
+    if score is None:
+        return float(hit.get("fusion_score") or 0.0)
+    return 1.0 / (1.0 + math.exp(-float(score)))
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
@@ -61,6 +76,7 @@ def run(
     *,
     fetch_k: int | None = None,
     top_k: int | None = None,
+    min_score: float = 0.0,
     attach_stories: bool | None = None,
     generate: bool = True,
     verbose: bool = True,
@@ -108,6 +124,10 @@ def run(
     # ---- stage 3: rerank -------------------------------------------------
     with _timer("rerank", timings):
         knowledge = models.rerank(question, fused, top_k)
+    # The similarity floor is applied here, not on the way out, so a passage the
+    # caller rejected is not quietly still in the context the answer came from.
+    if min_score > 0:
+        knowledge = [h for h in knowledge if normalized_score(h) >= min_score]
     if verbose:
         _print_rerank(knowledge, show_text, version)
 
@@ -159,6 +179,7 @@ def run(
         "knowledge": knowledge,
         "stories": stories,
         "context": context,
+        "user_prompt": user_prompt,
         "timings_ms": timings,
     }
 

@@ -14,6 +14,7 @@ import logging
 import re
 import time
 from functools import lru_cache
+from typing import Iterator
 
 import config
 import tracing
@@ -43,17 +44,7 @@ def chat(
     seed: int | None = None,
 ) -> str:
     primary = model or config.GROQ_MODEL
-    kwargs = {
-        "temperature": config.LLM_TEMPERATURE if temperature is None else temperature,
-        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-    }
-    if seed is not None:
-        kwargs["seed"] = seed
-    # Reasoning models (gpt-oss) spend the token budget on a hidden reasoning
-    # channel before writing any content. Left at the default effort they routinely
-    # exhaust max_tokens and return content='' with finish_reason='length'.
-    if config.GROQ_REASONING_EFFORT and "gpt-oss" in primary:
-        kwargs["reasoning_effort"] = config.GROQ_REASONING_EFFORT
+    kwargs = _kwargs(primary, temperature, max_tokens, seed)
 
     try:
         return _complete(primary, system, user, kwargs)
@@ -65,6 +56,60 @@ def chat(
         return _complete(config.GROQ_FALLBACK_MODEL, system, user, kwargs)
 
 
+def _kwargs(model: str, temperature, max_tokens, seed=None) -> dict:
+    kwargs = {
+        "temperature": config.LLM_TEMPERATURE if temperature is None else temperature,
+        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
+    }
+    if seed is not None:
+        kwargs["seed"] = seed
+    # Reasoning models (gpt-oss) spend the token budget on a hidden reasoning
+    # channel before writing any content. Left at the default effort they routinely
+    # exhaust max_tokens and return content='' with finish_reason='length'.
+    if config.GROQ_REASONING_EFFORT and "gpt-oss" in model:
+        kwargs["reasoning_effort"] = config.GROQ_REASONING_EFFORT
+    return kwargs
+
+
+@tracing.traceable(run_type="llm", name="groq.stream")
+def stream(system: str, user: str, *, model: str | None = None) -> Iterator[str]:
+    """Yield content deltas, for the HTTP API's token stream.
+
+    A stream cannot be retried once deltas have reached the browser, so this only
+    handles the failure it can: a failure BEFORE the first delta falls back to
+    `chat`, which owns the rate-limit retry and the model fallback. A break after
+    that ends the answer where it stopped rather than repeating it from the top.
+    """
+    primary = model or config.GROQ_MODEL
+    started = False
+    try:
+        response = _client().chat.completions.create(
+            model=primary,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            stream=True,
+            **_kwargs(primary, None, None),
+        )
+        for part in response:
+            delta = part.choices[0].delta.content if part.choices else None
+            if delta:
+                started = True
+                yield delta
+    except Exception as exc:  # noqa: BLE001
+        _abort_if_fatal(exc)
+        if started:
+            log.warning("stream broke mid-answer on %s: %s", primary, exc)
+            return
+        log.warning("stream failed on %s (%s); retrying without streaming", primary, exc)
+        yield chat(system, user, model=model)
+        return
+    if not started:
+        # An empty stream is the reasoning-model failure `chat` explains properly.
+        yield chat(system, user, model=model)
+
+
 def _abort_if_fatal(exc: Exception) -> None:
     """Stop the whole run on an error no other model or retry could fix.
 
@@ -72,10 +117,25 @@ def _abort_if_fatal(exc: Exception) -> None:
     doomed requests and buries the real cause under a wall of warnings. Callers
     deliberately catch `Exception` to keep going on a per-chunk failure — SystemExit
     is a BaseException, so it escapes those handlers and stops the run.
+
+    404 belongs here for the same reason. Groq retires models, and a retired id is
+    not a transient failure of one chunk: it fails for every chunk, and the fallback
+    model is usually retired in the same sweep. Without this, an ingest runs to
+    completion against a dead model and writes zero questions, reporting success.
     """
     status = getattr(exc, "status_code", None) or getattr(
         getattr(exc, "response", None), "status_code", None
     )
+    if status == 404:
+        raise SystemExit(
+            f"Groq does not have the model this run asked for:\n"
+            f"  {str(exc).splitlines()[0]}\n"
+            f"  GROQ_MODEL={config.GROQ_MODEL!r}  "
+            f"GROQ_FALLBACK_MODEL={config.GROQ_FALLBACK_MODEL!r}\n"
+            f"  Models get retired. List what your key can actually use with:\n"
+            f'      python -c "import config; from groq import Groq; '
+            f'print([m.id for m in Groq(api_key=config.GROQ_API_KEY).models.list().data])"'
+        )
     if status not in (401, 403):
         return
     raise SystemExit(

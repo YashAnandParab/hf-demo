@@ -12,6 +12,7 @@ previous version's database.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Sequence
@@ -106,10 +107,40 @@ def wait_for_db(timeout: float = 30.0) -> None:
                 conn.execute("SELECT 1")
             return
         except Exception as exc:  # noqa: BLE001
+            _abort_if_refused(exc)
             last = exc
             time.sleep(1.0)
     raise SystemExit(
         f"could not reach Postgres at {_safe_url()} after {timeout:.0f}s: {last}"
+    )
+
+
+# A server that answered and said no. Matched on the message, not on `sqlstate`:
+# a failure during CONNECT happens before there is a session to carry one, so
+# psycopg leaves sqlstate None on exactly the errors this is here to catch. It is
+# still checked first, for the cases that do arrive with one.
+#   28P01 wrong password   28000 not allowed by pg_hba   3D000 no such database
+_REFUSED_STATES = {"28P01", "28000", "3D000"}
+_REFUSED_TEXT = re.compile(r"authentication failed|no pg_hba\.conf entry|does not exist", re.I)
+
+
+def _abort_if_refused(exc: Exception) -> None:
+    """Fail immediately on a rejection, rather than waiting out the timeout.
+
+    On Windows the usual cause is the port: a native PostgreSQL service sits on
+    5432, so a POSTGRES_PORT left at the default reaches THAT server, which then
+    rejects a password that is perfectly correct for the pgvector container on
+    5433. The error says 'authentication failed' and the fix is a port number.
+    """
+    if getattr(exc, "sqlstate", None) not in _REFUSED_STATES and not _REFUSED_TEXT.search(str(exc)):
+        return
+    raise SystemExit(
+        f"Postgres refused the connection to {_safe_url()}:\n"
+        f"  {str(exc).splitlines()[0]}\n"
+        f"  Check POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD in .env.\n"
+        f"  If your pgvector database is in Docker, POSTGRES_PORT is the HOST\n"
+        f"  mapping (often 5433), not the container's own 5432 — a native Postgres\n"
+        f"  service on 5432 will answer and reject the other server's password."
     )
 
 

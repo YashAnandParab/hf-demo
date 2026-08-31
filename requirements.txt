@@ -2,6 +2,11 @@ psycopg[binary]>=3.1
 python-dotenv>=1.0
 sentence-transformers>=3.0
 groq>=0.11
+
+# HTTP API for the React frontend (api.py). Not needed by the CLIs.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+
 # tracing only. Without a LANGSMITH_API_KEY the decorators in tracing.py are a
 # no-op, and the package not being installed is handled too.
 langsmith>=0.2

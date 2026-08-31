@@ -115,8 +115,11 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
 # -------------------------------------------------------------- generation ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "llama-3.1-8b-instant")
+# Groq retires models without notice, and a retired one 404s on every request —
+# including the fallback, so the whole run fails. `python -c "from groq import Groq;
+# print([m.id for m in Groq().models.list().data])"` lists what a key can actually use.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODEL = os.getenv("GROQ_FALLBACK_MODEL", "openai/gpt-oss-20b")
 LLM_TEMPERATURE = _float("LLM_TEMPERATURE", 0.1)
 LLM_MAX_TOKENS = _int("LLM_MAX_TOKENS", 1024)
 # gpt-oss models only. They burn the token budget on a hidden reasoning channel
