@@ -1,6 +1,8 @@
 name: structured-rag
 
 services:
+  # The FastAPI backend (api.py) — GET /models, POST /chat — and the home of the
+  # CLIs, which you reach by exec-ing into it.
   app:
     build: .
     image: structured-rag:latest
@@ -13,6 +15,10 @@ services:
       POSTGRES_HOST: rag-postgres
       POSTGRES_PORT: 5432
       HF_HOME: /app/.hfcache
+    ports:
+      # Published so you can curl the API directly. The UI does NOT use this — it
+      # goes through nginx on the frontend container, same-origin.
+      - "8000:8000"
     volumes:
       - ./data:/app/data
       # The HOST HuggingFace cache, shared rather than duplicated. bge-m3 plus its
@@ -22,8 +28,64 @@ services:
       - ${HF_CACHE_DIR:-${USERPROFILE}/.cache/huggingface}:/app/.hfcache
     networks:
       - postgres
-    command: sleep infinity
+      - internal
+    healthcheck:
+      # No curl in python:3.12-slim, and /models answers without touching Postgres,
+      # so this reports "the server is up" and not "the corpus is ingested".
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/models', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      # Loading bge-m3 and the reranker takes ~30s cold, far longer on the first
+      # run when the weights are still downloading. Until this elapses a failing
+      # check is not counted against the container.
+      start_period: 300s
     restart: unless-stopped
+
+  # The React UI, built to static files and served by nginx, which also proxies
+  # /models and /chat to `app`. One origin for page and API: no CORS, and opening
+  # it from another machine on the LAN works with no rebuild.
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_APP_NAME: ${VITE_APP_NAME:-HFrag}
+    image: structured-rag-frontend:latest
+    container_name: structured-rag-frontend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      # Started, not healthy: the API needs minutes to warm its models on a cold
+      # cache, and there is no reason to keep the page unreachable that whole time.
+      # Until it answers, the UI shows "Cannot reach the RAG server."
+      app:
+        condition: service_started
+    networks:
+      - internal
+    restart: unless-stopped
+
+  # One-off CLI runs, for when you do NOT want a second 4.6GB copy of the models
+  # resident alongside the running API:
+  #     docker compose stop app
+  #     docker compose run --rm cli python ingest.py
+  #     docker compose run --rm cli python ingest.py --version normal
+  #     docker compose start app
+  # Under the `cli` profile, so `docker compose up` never starts it.
+  cli:
+    profiles: ["cli"]
+    build: .
+    image: structured-rag:latest
+    env_file: .env
+    environment:
+      POSTGRES_HOST: rag-postgres
+      POSTGRES_PORT: 5432
+      HF_HOME: /app/.hfcache
+    volumes:
+      - ./data:/app/data
+      - ${HF_CACHE_DIR:-${USERPROFILE}/.cache/huggingface}:/app/.hfcache
+    networks:
+      - postgres
+    command: ["sleep", "infinity"]
 
 networks:
   # The network the existing rag-postgres container (pgvector/pgvector:pg17)
@@ -33,6 +95,11 @@ networks:
   postgres:
     external: true
     name: postgress_default
+
+  # Frontend ↔ app. Its own network rather than the external one, so the UI
+  # container is not sitting on the database's network for no reason.
+  internal:
+    driver: bridge
 
 # No named volume for the model cache any more — the host cache is bind-mounted
 # above, so weights survive `docker compose down` by virtue of living outside

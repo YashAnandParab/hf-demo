@@ -1,6 +1,7 @@
 import { useEffect } from "react";
-import { ExternalLink, X } from "lucide-react";
+import { BookOpen, ExternalLink, X } from "lucide-react";
 import { useUi } from "../store";
+import { isStory } from "../types";
 import { cx } from "./ui";
 
 /** Right-hand evidence panel. Desktop: a resident column. Mobile: a drawer
@@ -16,9 +17,13 @@ export function SourcePanel() {
     return () => document.removeEventListener("keydown", onKey);
   }, [source, close]);
 
+  const story = !!source && isStory(source);
+
   const meta: [string, string][] = source
     ? ([
         ["Document", source.document],
+        ["Kind", story ? "Illustrative story" : "Authoritative knowledge"],
+        story && source.illustrates && ["Illustrates", source.illustrates],
         source.page != null && ["Page", String(source.page)],
         source.chunk != null && ["Chunk", String(source.chunk)],
         source.score != null && ["Similarity", source.score.toFixed(3)],
@@ -51,8 +56,9 @@ export function SourcePanel() {
           <>
             <header className="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
               <div className="min-w-0">
-                <p className="text-[10.5px] font-semibold tracking-[0.09em] text-ink-3 uppercase">
-                  Source
+                <p className="flex items-center gap-1.5 text-[10.5px] font-semibold tracking-[0.09em] text-ink-3 uppercase">
+                  {story && <BookOpen size={11} />}
+                  {story ? "Linked story" : "Source"}
                 </p>
                 <h2 className="mt-1.5 text-[15px] leading-snug font-medium text-ink">
                   {source.document}
@@ -69,12 +75,29 @@ export function SourcePanel() {
 
             <div className="scroll-quiet flex-1 overflow-y-auto px-5 py-5">
               <p className="text-[10.5px] font-semibold tracking-[0.09em] text-ink-3 uppercase">
-                Retrieved passage
+                {story ? "Story passage" : "Retrieved passage"}
               </p>
-              {/* The quoted chunk is the evidence — give it the brass rule. */}
-              <blockquote className="mt-2.5 border-l border-brass/60 pl-3.5 text-[13.5px] leading-relaxed text-ink">
+              {/* The quoted chunk is the evidence — give it the brass rule. A
+                  story illustrates that evidence, so it gets a plain one. */}
+              <blockquote
+                className={cx(
+                  "mt-2.5 border-l pl-3.5 text-[13.5px] leading-relaxed",
+                  story
+                    ? "border-line-strong text-ink-2 italic"
+                    : "border-brass/60 text-ink",
+                )}
+              >
                 {source.content}
               </blockquote>
+              {story && (
+                <p className="mt-2.5 text-[12px] leading-relaxed text-ink-3">
+                  Attached because{" "}
+                  {source.illustrates
+                    ? `${source.illustrates} cites it`
+                    : "a retrieved knowledge chunk cites it"}
+                  . It is context for the answer, not evidence for it.
+                </p>
+              )}
 
               <p className="mt-7 text-[10.5px] font-semibold tracking-[0.09em] text-ink-3 uppercase">
                 Metadata

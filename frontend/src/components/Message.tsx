@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import {
   AlertTriangle,
+  BookOpen,
   Check,
   ChevronRight,
   Copy,
@@ -13,6 +14,7 @@ import {
   ThumbsUp,
 } from "lucide-react";
 import { useChat, useModels, useUi } from "../store";
+import { isStory } from "../types";
 import type { Message as Msg, Source } from "../types";
 import { IconButton, cx, useToast } from "./ui";
 
@@ -97,9 +99,82 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 
 /* --------------------------------------------------------------- sources */
 
+/** One retrieved passage. Stories carry the quieter treatment: they reached the
+ *  answer as illustration, not as evidence, and the card should not claim
+ *  otherwise. */
+function SourceCard({ source }: { source: Source }) {
+  const openSource = useUi((s) => s.openSource);
+  const story = isStory(source);
+  const Icon = story ? BookOpen : FileText;
+
+  const meta = [
+    story && source.illustrates && `illustrates ${source.illustrates}`,
+    source.page != null && `p. ${source.page}`,
+    source.chunk != null && `chunk ${source.chunk}`,
+    source.score != null && `${source.score.toFixed(2)} sim`,
+  ]
+    .filter(Boolean)
+    .join("  ·  ");
+
+  return (
+    <li>
+      <button
+        onClick={() => openSource(source)}
+        className={cx(
+          "group flex w-full items-start gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors duration-150 hover:border-line-strong hover:bg-raised",
+          story ? "border-dashed border-line bg-transparent" : "border-line bg-surface",
+        )}
+      >
+        <span
+          className={cx(
+            "mt-0.5 grid h-5 min-w-5 shrink-0 place-items-center rounded-md border px-1 font-mono text-[10.5px]",
+            story
+              ? "border-line-strong bg-raised text-ink-2"
+              : "border-brass/35 bg-brass/10 text-brass",
+          )}
+        >
+          {source.id}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5">
+            <Icon size={12} className="shrink-0 text-ink-3" />
+            <span
+              className={cx(
+                "truncate text-[13px]",
+                story ? "text-ink-2" : "text-ink",
+              )}
+            >
+              {source.document}
+            </span>
+          </span>
+          {meta && (
+            <span className="mt-1 block truncate font-mono text-[11px] text-ink-3">
+              {meta}
+            </span>
+          )}
+        </span>
+        <ChevronRight
+          size={14}
+          className="mt-1 shrink-0 text-ink-3 transition-transform duration-150 group-hover:translate-x-0.5"
+        />
+      </button>
+    </li>
+  );
+}
+
+function GroupLabel({ children }: { children: ReactNode }) {
+  return (
+    <p className="mt-3 mb-1.5 text-[10.5px] font-semibold tracking-[0.09em] text-ink-3 uppercase first:mt-0">
+      {children}
+    </p>
+  );
+}
+
 function SourceList({ sources }: { sources: Source[] }) {
   const [open, setOpen] = useState(false);
-  const openSource = useUi((s) => s.openSource);
+
+  const knowledge = sources.filter((s) => !isStory(s));
+  const stories = sources.filter(isStory);
 
   return (
     <section className="mt-5 border-t border-line pt-3">
@@ -114,46 +189,38 @@ function SourceList({ sources }: { sources: Source[] }) {
         />
         Sources
         <span className="ml-0.5 rounded-full border border-line-strong px-1.5 font-mono text-[10.5px] text-ink-3">
-          {sources.length}
+          {knowledge.length}
         </span>
+        {/* A story in the answer's context is worth seeing before expanding. */}
+        {!!stories.length && (
+          <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-line-strong px-1.5 font-mono text-[10.5px] text-ink-3">
+            <BookOpen size={10} />
+            {stories.length} {stories.length === 1 ? "story" : "stories"}
+          </span>
+        )}
       </button>
 
       {open && (
-        <ul className="mt-2.5 space-y-1.5">
-          {sources.map((s) => (
-            <li key={s.id}>
-              <button
-                onClick={() => openSource(s)}
-                className="group flex w-full items-start gap-3 rounded-xl border border-line bg-surface px-3 py-2.5 text-left transition-colors duration-150 hover:border-line-strong hover:bg-raised"
-              >
-                <span className="mt-0.5 grid h-5 min-w-5 shrink-0 place-items-center rounded-md border border-brass/35 bg-brass/10 px-1 font-mono text-[10.5px] text-brass">
-                  {s.id}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-1.5">
-                    <FileText size={12} className="shrink-0 text-ink-3" />
-                    <span className="truncate text-[13px] text-ink">
-                      {s.document}
-                    </span>
-                  </span>
-                  <span className="mt-1 block truncate font-mono text-[11px] text-ink-3">
-                    {[
-                      s.page != null && `p. ${s.page}`,
-                      s.chunk != null && `chunk ${s.chunk}`,
-                      s.score != null && `${s.score.toFixed(2)} sim`,
-                    ]
-                      .filter(Boolean)
-                      .join("  ·  ")}
-                  </span>
-                </span>
-                <ChevronRight
-                  size={14}
-                  className="mt-1 shrink-0 text-ink-3 transition-transform duration-150 group-hover:translate-x-0.5"
-                />
-              </button>
-            </li>
-          ))}
-        </ul>
+        // Only label the groups when there are two kinds to tell apart — the
+        // flat version has nothing to separate.
+        <div className="mt-2.5">
+          {!!stories.length && <GroupLabel>Knowledge</GroupLabel>}
+          <ul className="space-y-1.5">
+            {knowledge.map((s) => (
+              <SourceCard key={s.id} source={s} />
+            ))}
+          </ul>
+          {!!stories.length && (
+            <>
+              <GroupLabel>Illustrative stories</GroupLabel>
+              <ul className="space-y-1.5">
+                {stories.map((s) => (
+                  <SourceCard key={s.id} source={s} />
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
       )}
     </section>
   );

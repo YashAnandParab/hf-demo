@@ -23,10 +23,18 @@ COPY tools/*.py ./tools/
 # Model weights land in HF_HOME, which compose bind-mounts to the host's own
 # HuggingFace cache — so the ~4.6GB for bge-m3 and its reranker is downloaded once
 # and shared with the local venv, rather than once per environment.
-#
-# The container idles rather than running anything: this is a CLI tool, so you
-# exec into it.
+
+EXPOSE 8000
+
+# The HTTP API the React frontend talks to. The CLIs are still here and are run by
+# exec-ing into this container (or `docker compose run --rm cli …`, which does not
+# hold a second copy of the models):
 #     docker compose exec app python ingest.py
 #     docker compose exec app python ingest.py --version normal
 #     docker compose exec -it app python query.py --repl
-CMD ["sleep", "infinity"]
+#
+# ONE worker, deliberately. Everything downstream of api.py is process-wide state —
+# one Postgres connection, one active version, one resident embedder and reranker —
+# serialised by a single lock. A second worker would be a second 4.6GB copy of the
+# models guarding a lock the first one cannot see.
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

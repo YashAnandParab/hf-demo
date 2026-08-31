@@ -11,6 +11,9 @@ export interface Model {
   capabilities?: string[];
 }
 
+/** Authoritative evidence vs. the illustrative story attached to it. */
+export type SourceKind = "knowledge" | "story";
+
 export interface Source {
   /** The label the answer cites: K1/S1 structured, P1 flat. */
   id: string;
@@ -21,11 +24,22 @@ export interface Source {
   page?: number;
   chunk?: number;
   content: string;
-  /** Rerank / similarity score, 0..1. */
+  /** Rerank / similarity score, 0..1. Stories are attached, not scored. */
   score?: number;
   /** Which retrieval arms surfaced it: vector, fulltext, questions. */
   arms?: string[];
+  /** Set by the structured backend; older payloads fall back to the id prefix. */
+  kind?: SourceKind;
+  /** Story only: the [K*] labels it illustrates, e.g. "K1, K3". */
+  illustrates?: string;
 }
+
+/** A story chunk reached the answer because a retrieved knowledge chunk cites
+ *  it, so it is evidence of a different kind and is shown as such. */
+export const sourceKind = (s: Source): SourceKind =>
+  s.kind ?? (s.id.startsWith("S") ? "story" : "knowledge");
+
+export const isStory = (s: Source) => sourceKind(s) === "story";
 
 export type Role = "user" | "assistant";
 

@@ -11,3 +11,7 @@ __pycache__/
 
 # bind-mounted at runtime
 data/
+
+# built by its own Dockerfile from ./frontend as the context. Excluded here so a
+# 200MB node_modules is never uploaded as part of the backend's build context.
+frontend/

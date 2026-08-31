@@ -10,6 +10,9 @@ npm run build    # type-check + production bundle
 npm run check    # SSE stream-parser self-check
 ```
 
+Or in Docker, where the backend comes up alongside it — `docker compose up -d`
+from the parent directory, then <http://localhost:5173>. See the root README.
+
 ## Configuration
 
 `.env` (copied from `.env.example`):
@@ -18,6 +21,13 @@ npm run check    # SSE stream-parser self-check
 |---|---|---|
 | `VITE_API_BASE_URL` | `http://localhost:8000` | Where `api.py` is listening |
 | `VITE_APP_NAME` | `HFrag` | Name in the sidebar and empty state |
+
+Both are inlined by Vite at **build** time, not read at runtime. The Docker image
+therefore leaves `VITE_API_BASE_URL` empty on purpose: `api.ts` falls back to
+`location.origin`, and nginx (`nginx.conf`) proxies `/models` and `/chat` to the
+backend container from that same origin. That is what removes CORS from the picture
+and lets one image work at `localhost` and at a LAN address alike. `VITE_APP_NAME`
+is a build arg — `VITE_APP_NAME="My RAG" docker compose build frontend`.
 
 ## The "model" picker is the version picker
 
@@ -80,11 +90,20 @@ A source maps onto what `query.run()` already returns:
 | `content` | `chunk_text` |
 | `score` | `rerank_score`, squashed to 0..1 |
 | `arms` | `sources` (`vector` / `fts` / `hq`), or `linked story` |
+| `kind` | `knowledge` or `story` (falls back to the `S` id prefix) |
+| `illustrates` | story only: `linked_knowledge_label`, e.g. `K1, K3` |
 
 Citation markers in the answer (`[K1]`, `[S1]`, `[P1]`, or a bare `[1]`) resolve
 against the `sources` array by `id` and become clickable references. Markers with
 no matching source stay as plain text, so a hallucinated `[7]` never offers a
 dead link.
+
+The source list splits the two kinds: knowledge chunks keep the brass evidence
+treatment, and any attached story is listed under **Illustrative stories** in a
+quieter, dashed style with the knowledge chunk it illustrates — the same
+distinction the prompt draws between evidence and illustration. Stories carry no
+similarity because they were attached by a link, not scored. When a version has
+no stories the list stays flat and unlabelled.
 
 ## Layout
 

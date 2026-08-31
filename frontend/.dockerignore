@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# VITE_* is inlined at build time; baking a developer's local .env into the image
+# would hard-code their API base URL for everyone. See the note in Dockerfile.
+.env
+.env.*
+!.env.example
+
+Dockerfile
+.dockerignore
+README.md
+DESIGN.md

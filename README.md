@@ -113,13 +113,68 @@ Then:
 
 ```bash
 cp .env.example .env                  # put your GROQ_API_KEY in
-docker compose up -d --build          # ~3 min: CPU torch + transformers
-docker compose exec app python ingest.py data/chunks.json --dry-run
+docker compose up -d --build          # ~3 min: CPU torch + transformers, then the UI
 ```
 
-The container idles rather than running anything — this is a CLI tool, so you exec
-into it. `./data` is bind-mounted, so editing `data/chunks.json` on the host needs
-no rebuild; editing a `.py` file does (`docker compose build`, ~2s from cache).
+That brings up two containers:
+
+| Service | Container | URL | What it is |
+|---|---|---|---|
+| `frontend` | `structured-rag-frontend` | **http://localhost:5173** | the chat UI — **open this** |
+| `app` | `structured-rag` | http://localhost:8000 | `api.py`, and the home of the CLIs |
+
+The backend is not ready the moment the container starts: it warms `bge-m3` and the
+reranker first, ~35s with the weights already cached and several minutes without.
+Until it answers, the UI says "Cannot reach the RAG server." Watch it come up with
+`docker compose logs -f app` — `ready — versions: structured, normal` is the line —
+or wait for the healthcheck:
+
+```bash
+docker compose ps                     # app: (healthy)
+```
+
+**Ingest still happens through the CLIs**, by exec-ing into the running backend:
+
+```bash
+docker compose exec app python ingest.py data/chunks.json --dry-run
+docker compose exec app python ingest.py
+docker compose exec app python ingest.py --version normal
+docker compose exec -it app python query.py --repl
+```
+
+Each of those loads its **own** copy of the embedder and reranker, ~4.6GB on top of
+the copy the API is already holding. If the machine is tight on RAM (on Windows the
+symptom is `winerror 1455`, "the paging file is too small"), use the one-off `cli`
+service with the API stopped instead:
+
+```bash
+docker compose stop app
+docker compose run --rm cli python ingest.py
+docker compose start app
+```
+
+`./data` is bind-mounted, so editing `data/chunks.json` on the host needs no
+rebuild; editing a `.py` file does (`docker compose build app`, ~2s from cache), and
+editing anything under `frontend/` needs `docker compose build frontend`.
+
+#### How the UI reaches the API
+
+The browser only ever talks to **one origin**, port 5173. nginx serves the built
+bundle and proxies `/models` and `/chat` through to `app:8000` on an internal
+network. So there is no CORS to configure, and `ALLOWED_ORIGINS` does not come into
+it. Port 8000 is published as well, but only so you can `curl` the API directly —
+the UI does not use it.
+
+Vite inlines `VITE_*` at **build** time, so `frontend/.env` is not read by the
+container and `VITE_API_BASE_URL` is deliberately left empty in the image: the app
+falls back to `location.origin`, which is what makes the same image work whether you
+open it at `localhost:5173` or at `http://<your-lan-ip>:5173` from another machine.
+Two things are still adjustable from the host, without a rebuild for the first:
+
+```bash
+FRONTEND_PORT=3000 docker compose up -d          # publish the UI somewhere else
+VITE_APP_NAME="My RAG" docker compose build frontend   # rename it in the sidebar
+```
 
 Model weights are **not** in a container-private volume. `HF_HOME` is bind-mounted
 to the host's own HuggingFace cache (`%USERPROFILE%\.cache\huggingface`, or set
@@ -255,14 +310,19 @@ SELECT count(*) FROM normal_chunks;            -- all of them retrievable
 ## 6. Ask in a browser
 
 `api.py` is the same pipeline behind two endpoints, and `frontend/` is a React
-chat client for it. Two terminals:
+chat client for it.
+
+In Docker both are already running — `docker compose up -d` and open
+<http://localhost:5173>; see [Docker](#docker) above.
+
+From the local venv, two terminals:
 
 ```bash
 uvicorn api:app --port 8000            # loads the models, then serves
 cd frontend && npm install && npm run dev
 ```
 
-Open <http://localhost:5173>. The picker in the composer lists the two **versions**,
+Either way, open <http://localhost:5173>. The picker in the composer lists the two **versions**,
 not two LLMs: choosing one switches the database the answer is retrieved from.
 Which LLM writes it stays `GROQ_MODEL`, the same for both, so a difference between
 two answers is still attributable to the structure.
@@ -425,6 +485,16 @@ through a single bad chunk.
 
 **In Docker, `.env` is read when the container is created**, not on `exec`. After
 editing it: `docker compose up -d --force-recreate`.
+
+**"Cannot reach the RAG server" in the UI** is almost always the backend still
+warming up — it loads bge-m3 and the reranker before it binds, ~35s cached and
+several minutes on a cold HuggingFace cache. `docker compose ps` shows `app` as
+`(health: starting)` until then. If it stays unreachable after that, the proxy hop
+is the thing to test, because it isolates the UI from the API:
+`curl http://localhost:5173/models` (through nginx) versus
+`curl http://localhost:8000/models` (the API directly). The second working and the first
+not means nginx cannot see the `app` container; both failing means the API itself
+is down — `docker compose logs app`.
 
 **Rate limits.** A free Groq key will rate-limit during ingestion, since HQ
 generation is one call per chunk. `llm.py` waits out a 429 (honouring `retry-after`,

@@ -227,13 +227,15 @@ def _sources(result: dict) -> list[dict]:
     tag = "K" if versions.active().has_stories else "P"
     out = [_source(h, f"{tag}{i}") for i, h in enumerate(result["knowledge"], start=1)]
     out += [
-        _source(h, f"S{i}", arms=["linked story"])
+        _source(h, f"S{i}", arms=["linked story"], story=True)
         for i, h in enumerate(result["stories"], start=1)
     ]
     return out
 
 
-def _source(hit: dict, label: str, arms: list[str] | None = None) -> dict:
+def _source(
+    hit: dict, label: str, arms: list[str] | None = None, story: bool = False
+) -> dict:
     return {
         "id": label,
         "document": hit.get("article_name") or "Untitled",
@@ -242,6 +244,11 @@ def _source(hit: dict, label: str, arms: list[str] | None = None) -> dict:
         "content": (hit.get("chunk_text") or "").strip(),
         # A story was attached, not scored — a similarity bar on one would be a
         # number that nothing actually produced.
-        "score": round(query.normalized_score(hit), 3) if arms is None else None,
+        "score": None if story else round(query.normalized_score(hit), 3),
         "arms": arms or hit.get("sources") or [],
+        # The frontend separates evidence from illustration, and for a story it
+        # shows which knowledge chunk pulled it in — the same relation the
+        # prompt states as "illustrates K1".
+        "kind": "story" if story else "knowledge",
+        "illustrates": (hit.get("linked_knowledge_label") or None) if story else None,
     }
