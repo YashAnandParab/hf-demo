@@ -7,6 +7,7 @@ yourself or keep them in the file.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -54,6 +55,21 @@ DATABASE_URL = os.getenv("DATABASE_URL") or (
     f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
     f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 )
+
+# CREATE DATABASE cannot run inside the database being created, so creating the
+# normal-chunking database needs a connection to some other one that already
+# exists. `postgres` is present on every stock server.
+POSTGRES_MAINTENANCE_DB = os.getenv("POSTGRES_MAINTENANCE_DB", "postgres")
+
+# ---------------------------------------------------------------- versions ---
+# Two RAG versions run side by side out of this one codebase, each in its own
+# database so their corpora, counts and stats never mix. See versions.py.
+#   structured -> POSTGRES_DB          (knowledge/story split)
+#   normal     -> NORMAL_POSTGRES_DB   (flat baseline)
+NORMAL_POSTGRES_DB = os.getenv("NORMAL_POSTGRES_DB", "normal_chunking")
+# Which version the CLIs start on when neither --version nor the interactive
+# chooser picks one.
+DEFAULT_VERSION = os.getenv("RAG_VERSION", "structured").strip().lower()
 
 # -------------------------------------------------------------- embeddings ---
 # Local sentence-transformers model. bge-m3 is 1024-dim with an 8192-token window,
@@ -143,8 +159,31 @@ LANGSMITH_TRACING = _bool("LANGSMITH_TRACING", True)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 
+def _force_utf8_stdio() -> None:
+    """Stop a non-ASCII character in an answer from killing the process.
+
+    The Windows console defaults to cp1252, which cannot encode the punctuation
+    LLMs routinely produce — non-breaking hyphens, en dashes, curly quotes. Printing
+    one raises UnicodeEncodeError from inside `print`, so the run dies AFTER the
+    model has been paid for and every retrieval stage has been computed, with a
+    stack trace where the answer should be. `errors="replace"` degrades that to a
+    substituted character.
+    """
+    for stream in ("stdout", "stderr"):
+        handle = getattr(sys, stream, None)
+        reconfigure = getattr(handle, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def setup_logging() -> None:
     import logging
+
+    _force_utf8_stdio()
 
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL, logging.INFO),

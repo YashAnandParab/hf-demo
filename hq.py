@@ -14,6 +14,7 @@ import re
 
 import config
 import prompts
+import versions
 from llm import chat
 
 log = logging.getLogger("hq")
@@ -21,12 +22,18 @@ log = logging.getLogger("hq")
 _LEADING_MARKER = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s*")
 
 
+def _system_prompt() -> str:
+    """The structured version only ever passes knowledge chunks here, so its prompt
+    can say so. The flat version passes every chunk, narratives included."""
+    return prompts.HQ_SYSTEM if versions.active().has_stories else prompts.HQ_SYSTEM_NORMAL
+
+
 def generate_questions(text: str, n: int | None = None) -> list[str]:
     n = config.HQ_PER_CHUNK if n is None else n
     if n <= 0 or not text.strip():
         return []
     try:
-        raw = chat(prompts.HQ_SYSTEM, prompts.build_hq_prompt(text, n), max_tokens=256)
+        raw = chat(_system_prompt(), prompts.build_hq_prompt(text, n), max_tokens=256)
     except Exception as exc:  # noqa: BLE001
         log.warning("question generation failed: %s", exc)
         return []

@@ -1,8 +1,17 @@
-"""Ingest hand-written flat chunk JSON into the structured RAG tables.
+"""Ingest hand-written flat chunk JSON into one version's tables.
 
-    python ingest.py data/chunks.json
-    python ingest.py data/chunks.json --dry-run     # parse + audit, writes nothing
-    python ingest.py data/chunks.json --reset       # drop the tables first
+    python ingest.py                                    # structured, data/chunks.json
+    python ingest.py --version normal                   # normal, data/chunks_normal.json
+    python ingest.py data/chunks.json --dry-run         # parse + audit, writes nothing
+    python ingest.py data/chunks.json --reset           # drop the tables first
+
+The input file defaults to whichever file the chosen version owns, so the two are
+hard to mix up by accident; passing a path explicitly overrides that.
+
+Each version writes to its OWN database (see versions.py). The normal version's
+database is created on first ingest if it does not exist yet.
+
+--- structured ---
 
 Ordering is two-pass and GLOBAL, not per-article:
 
@@ -29,6 +38,11 @@ the schema enforces it.
 Re-ingesting an article deletes its existing chunks first, so this is idempotent.
 Note that re-ingesting only PART of a corpus will drop cross-article links whose
 story lives in an article that was not part of this run — ingest the whole file.
+
+--- normal ---
+
+One pass, no links: every chunk is embedded, indexed and given hypothetical
+questions, because in the flat version every chunk is a retrieval candidate.
 """
 from __future__ import annotations
 
@@ -39,6 +53,7 @@ from pathlib import Path
 
 import config
 import tracing
+import versions
 from loader import RawChunk, audit, count_tokens, group_by_article, load_chunks
 
 # db / models / llm are imported inside the functions that need them, so that
@@ -51,6 +66,13 @@ _INSERT_CHUNK_SQL = """
         (article_id, source_chunk_id, chunk_index, chunk_text,
          content_type, token_count, embedding)
     VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
+    RETURNING chunk_id
+"""
+
+_INSERT_NORMAL_CHUNK_SQL = """
+    INSERT INTO normal_chunks
+        (article_id, source_chunk_id, chunk_index, chunk_text, token_count, embedding)
+    VALUES (%s, %s, %s, %s, %s, %s::vector)
     RETURNING chunk_id
 """
 
@@ -166,14 +188,79 @@ def ingest_all(groups: dict[str, list[RawChunk]], *, with_questions: bool) -> di
     return totals
 
 
+@tracing.traceable(run_type="chain", name="ingest_normal")
+def ingest_all_normal(groups: dict[str, list[RawChunk]], *, with_questions: bool) -> dict:
+    """Insert every article and every chunk. No types, no links, one pass.
+
+    Every chunk is embedded — that is the whole difference from the structured
+    ingester, which skips stories. Nothing here can decide a chunk is not worth
+    retrieving, because in this version nothing knows what kind of chunk it is.
+    """
+    import db
+    import models
+
+    prepared: list[tuple[int, list[RawChunk]]] = []
+    for group in groups.values():
+        chunks = sorted(group, key=lambda c: (c.source_chunk_id is None, c.source_chunk_id or 0))
+        head = chunks[0]
+        article_id = db.upsert_article(
+            article_name=head.article_name,
+            full_text="\n\n".join(c.chunk_text for c in chunks),
+            article_url=head.article_url,
+            author=head.author,
+            published_date=head.published_date,
+            site=head.site,
+        )
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM normal_chunks WHERE article_id = %s", (article_id,))
+        prepared.append((article_id, chunks))
+
+    all_chunks = [c for _, chunks in prepared for c in chunks]
+    log.info("embedding all %d chunk(s) — every chunk is retrievable in this version",
+             len(all_chunks))
+    vectors = iter(models.embed_documents([c.chunk_text for c in all_chunks]))
+
+    inserted: list[tuple[RawChunk, int]] = []
+    with db.cursor() as cur:
+        for article_id, chunks in prepared:
+            for chunk_index, chunk in enumerate(chunks):
+                cur.execute(
+                    _INSERT_NORMAL_CHUNK_SQL,
+                    (
+                        article_id,
+                        chunk.source_chunk_id,
+                        chunk_index,
+                        chunk.chunk_text,
+                        count_tokens(chunk.chunk_text),
+                        db.to_pgvector(next(vectors)),
+                    ),
+                )
+                inserted.append((chunk, int(cur.fetchone()["chunk_id"])))
+
+    question_count = 0
+    if with_questions and config.HQ_ENABLED:
+        question_count = ingest_questions([(db_id, c.chunk_text) for c, db_id in inserted])
+
+    totals = {
+        "articles": len(prepared),
+        "chunks": len(all_chunks),
+        "questions": question_count,
+    }
+    tracing.add_metadata(**totals)
+    return totals
+
+
 @tracing.traceable(run_type="chain", name="hypothetical_questions")
 def ingest_questions(targets: list[tuple[int, str]]) -> int:
-    """Generate hypothetical questions for knowledge chunks.
+    """Generate hypothetical questions and index them as the third retrieval arm.
 
-    Only knowledge chunks get them: the HQ arm is a retrieval arm, and a story is
-    never a retrieval candidate, so questions written for one could not match
-    anything. Generating them would cost an LLM call plus an embedding per story
-    for rows nothing can reach.
+    Structured: only knowledge chunks are passed in by the caller, because the HQ
+    arm is a retrieval arm and a story is never a retrieval candidate — questions
+    written for one could not match anything, so generating them would cost an LLM
+    call plus an embedding per story for rows nothing can reach.
+
+    Normal: every chunk is passed in, for the same reason read the other way —
+    every chunk is a retrieval candidate.
     """
     import db
     import hq
@@ -182,6 +269,7 @@ def ingest_questions(targets: list[tuple[int, str]]) -> int:
     if not targets:
         return 0
 
+    table = versions.active().question_table
     per_chunk = hq.generate_questions_bulk([text for _, text in targets])
     pairs = [
         (db_id, question)
@@ -194,8 +282,8 @@ def ingest_questions(targets: list[tuple[int, str]]) -> int:
     vectors = models.embed_documents([q for _, q in pairs])
     with db.cursor() as cur:
         cur.executemany(
-            """
-            INSERT INTO structured_chunk_questions (chunk_id, question_text, embedding)
+            f"""
+            INSERT INTO {table} (chunk_id, question_text, embedding)
             VALUES (%s, %s, %s::vector)
             """,
             [(cid, q, db.to_pgvector(v)) for (cid, q), v in zip(pairs, vectors)],
@@ -206,6 +294,19 @@ def ingest_questions(targets: list[tuple[int, str]]) -> int:
 # --------------------------------------------------------------------------- #
 # Dry run
 # --------------------------------------------------------------------------- #
+
+
+def print_dry_run_normal(groups: dict[str, list[RawChunk]], report) -> None:
+    print("\n--- dry run, nothing written ---")
+    for key, group in groups.items():
+        head = group[0]
+        print(f"\n{head.article_name}  ({key})")
+        for c in sorted(group, key=lambda c: c.source_chunk_id or 0):
+            print(f"  #{str(c.source_chunk_id):<5} {count_tokens(c.chunk_text):>4} tok")
+    total = sum(len(g) for g in groups.values())
+    print(f"\n  {total} chunk(s), all embedded, all retrievable — no types, no links")
+    if report.errors:
+        print(f"\n{len(report.errors)} error(s) — fix these before ingesting.")
 
 
 def print_dry_run(groups: dict[str, list[RawChunk]], report) -> None:
@@ -245,8 +346,14 @@ def main() -> None:
     parser.add_argument(
         "input",
         nargs="?",
-        default=str(config.DATA_DIR / "chunks.json"),
-        help="chunk JSON file or a directory of them (default: data/chunks.json)",
+        default=None,
+        help="chunk JSON file or a directory of them (default: the chosen version's own file)",
+    )
+    parser.add_argument(
+        "--version",
+        choices=versions.keys(),
+        default=config.DEFAULT_VERSION,
+        help="which RAG version to ingest into (default: %(default)s)",
     )
     parser.add_argument(
         "--dry-run",
@@ -259,17 +366,30 @@ def main() -> None:
 
     config.setup_logging()
 
-    path = Path(args.input)
-    if not path.exists():
-        raise SystemExit(f"input path not found: {path}")
+    # Set before anything reads it: db picks its database from here, hq picks its
+    # prompt, retrieval builds its SQL, and the loader is told whether to expect
+    # types and links.
+    version = versions.use(args.version)
+    structured = version.has_stories
 
-    chunks, report = load_chunks(path)
-    audit(chunks, report)
+    path = Path(args.input) if args.input else version.chunks_path
+    if not path.exists():
+        hint = ""
+        if not args.input and not structured:
+            hint = "\n  Generate it with: python tools/make_normal_chunks.py"
+        raise SystemExit(f"input path not found: {path}{hint}")
+
+    print(f"version: {version.label}  ({version.blurb})")
+    print(f"  file     {path}")
+    print(f"  database {version.database}")
+
+    chunks, report = load_chunks(path, structured=structured)
+    audit(chunks, report, structured=structured)
     report.log()
 
     if not chunks:
         raise SystemExit("no usable chunks found — see the errors above")
-    if report.legacy_link_keys:
+    if structured and report.legacy_link_keys:
         raise SystemExit(
             f"{report.legacy_link_keys} chunk(s) still declare 'related_knowledge_chunk_ids'. "
             f"Links now live on the knowledge chunk as 'related_story_chunk_ids'; ingesting "
@@ -277,16 +397,20 @@ def main() -> None:
         )
 
     groups = group_by_article(chunks)
-    log.info(
-        "%d usable chunk(s) across %d article(s): %d knowledge, %d story",
-        len(chunks),
-        len(groups),
-        sum(1 for c in chunks if c.content_type == "knowledge"),
-        sum(1 for c in chunks if c.content_type == "story"),
-    )
+    if structured:
+        log.info(
+            "%d usable chunk(s) across %d article(s): %d knowledge, %d story",
+            len(chunks),
+            len(groups),
+            sum(1 for c in chunks if c.content_type == "knowledge"),
+            sum(1 for c in chunks if c.content_type == "story"),
+        )
+    else:
+        log.info("%d usable chunk(s) across %d article(s), all retrievable",
+                 len(chunks), len(groups))
 
     if args.dry_run:
-        print_dry_run(groups, report)
+        (print_dry_run if structured else print_dry_run_normal)(groups, report)
         return
 
     import db
@@ -294,6 +418,8 @@ def main() -> None:
     import retrieval
 
     db.wait_for_db()
+    # The normal version's database does not exist until the first ingest.
+    db.ensure_database()
     if args.reset:
         db.reset_schema()
     else:
@@ -309,19 +435,25 @@ def main() -> None:
             f"{config.EMBED_DIM}. Set EMBED_DIM={actual_dim} and re-run with --reset."
         )
 
-    totals = ingest_all(groups, with_questions=not args.no_questions)
-
-    log.info(
-        "done: %d articles, %d knowledge, %d story, %d links, %d questions",
-        totals["articles"], totals["knowledge"], totals["stories"],
-        totals["links"], totals["questions"],
-    )
+    if structured:
+        totals = ingest_all(groups, with_questions=not args.no_questions)
+        log.info(
+            "done: %d articles, %d knowledge, %d story, %d links, %d questions",
+            totals["articles"], totals["knowledge"], totals["stories"],
+            totals["links"], totals["questions"],
+        )
+    else:
+        totals = ingest_all_normal(groups, with_questions=not args.no_questions)
+        log.info(
+            "done: %d articles, %d chunks, %d questions",
+            totals["articles"], totals["chunks"], totals["questions"],
+        )
 
     counts = retrieval.stats()
-    print("\n--- database ---")
+    print(f"\n--- database {version.database} ({version.key}) ---")
     for key, value in counts.items():
-        print(f"  {key:<20} {value}")
-    if counts["orphan_stories"]:
+        print(f"  {key:<24} {value}")
+    if counts.get("orphan_stories"):
         print(
             "\n  note: orphan stories are cited by no knowledge chunk. Stories are never\n"
             "  retrieved directly, so nothing can ever pull them into an answer."

@@ -15,7 +15,10 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py schema.sql ./
+# Both schemas, not just schema.sql — each version reads its own at init, so a
+# missing one fails the normal version at the first ingest rather than at build.
+COPY *.py *.sql ./
+COPY tools/*.py ./tools/
 
 # Model weights land in HF_HOME, which compose bind-mounts to the host's own
 # HuggingFace cache — so the ~4.6GB for bge-m3 and its reranker is downloaded once
@@ -23,6 +26,7 @@ COPY *.py schema.sql ./
 #
 # The container idles rather than running anything: this is a CLI tool, so you
 # exec into it.
-#     docker compose exec app python ingest.py data/chunks.json
+#     docker compose exec app python ingest.py
+#     docker compose exec app python ingest.py --version normal
 #     docker compose exec -it app python query.py --repl
 CMD ["sleep", "infinity"]

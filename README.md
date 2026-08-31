@@ -16,11 +16,49 @@ embed ─┬─ vector_search ─┐
 Every stage prints, so you can see which chunks were retrieved by which arm, which
 survived reranking, and what the answer was actually built from.
 
+## Two versions, side by side
+
+The point of the project is the comparison, so the flat baseline ships with it:
+
+| | **structured** | **normal** |
+|---|---|---|
+| corpus | `data/chunks.json` | `data/chunks_normal.json` |
+| database | `postgres` | `normal_chunking` |
+| chunk types | `knowledge` / `story` | none |
+| retrievable | knowledge only | every chunk |
+| links | knowledge → story | none |
+| stage 4 | attaches linked stories | no-op |
+| prompt | evidence vs. illustration | one kind of passage |
+
+Everything else is shared: same text, same embedding model, same three arms, same
+fusion weights, same reranker, same LLM. So any difference in the answers is
+attributable to the structure and nothing else — which is why the two are one
+codebase rather than two projects. See [versions.py](versions.py).
+
+`data/chunks_normal.json` is **generated** from `data/chunks.json` by deleting
+`chunk_type` and `related_story_chunk_ids`; the chunk text is copied through
+untouched. Regenerate it whenever the source changes, or the two versions are
+answering from different corpora:
+
+```bash
+python tools/make_normal_chunks.py
+```
+
+Pick a version with `--version`, or omit it and `query.py` will ask.
+
+```bash
+python ingest.py --version normal      # creates the normal_chunking database
+python query.py "why start investing early" --version normal
+python query.py --repl                 # asks, then ':version normal' to switch
+```
+
 ## Layout
 
 ```
 config.py        every setting, env-driven
-schema.sql       articles, chunks, knowledge→story links, questions
+versions.py      the two versions: database, schema, corpus, prompt
+schema.sql       structured: articles, chunks, knowledge→story links, questions
+schema_normal.sql  normal: articles, chunks, questions — no types, no links
 tracing.py       optional LangSmith tracing; a no-op without a key
 db.py            connection, transactions, schema init, article upsert
 loader.py        parses your hand-written chunk JSON; normalises and audits it
@@ -29,11 +67,13 @@ llm.py           Groq chat, with 429 handling that retries the SAME model
 hq.py            hypothetical-question generation
 fusion.py        reciprocal rank fusion
 retrieval.py     the three arms, the story link walk, /stats
-prompts.py       system prompts and context formatting
+prompts.py       system prompts and context formatting, for both versions
 ingest.py        JSON  → database
 query.py         question → answer, every stage printed
 test_loader.py   offline tests: no db, no models, no API key
-data/chunks.json your chunks
+data/chunks.json          your chunks
+data/chunks_normal.json   generated: the same chunks, stripped of structure
+tools/make_normal_chunks.py  regenerates the above
 ```
 
 ---
@@ -139,29 +179,38 @@ The Shift Most Investors Need To Make  (https://…/the-shift-most-investors-nee
 ## 3. Ingest
 
 ```bash
-python ingest.py data/chunks.json
-python ingest.py data/chunks.json --reset          # drop the tables and start over
-python ingest.py data/chunks.json --no-questions   # skip HQ generation (no LLM cost)
+python ingest.py                                   # structured, data/chunks.json
+python ingest.py --version normal                  # normal, data/chunks_normal.json
+python ingest.py --reset                           # drop the tables and start over
+python ingest.py --no-questions                    # skip HQ generation (no LLM cost)
 ```
+
+The input file defaults to whichever file the chosen version owns; pass a path to
+override. Each version writes to its own database, and the normal one is created
+on its first ingest.
 
 Re-ingesting an article deletes its chunks first, so this is idempotent.
 
 ## 4. Ask
 
 ```bash
-python query.py "why start investing early"
+python query.py "why start investing early"        # asks which version
+python query.py "..." --version normal             # skip the chooser
 python query.py --repl                             # models stay resident between questions
 python query.py "..." --fetch-k 30 --top-k 8
 python query.py "..." --retrieval-only             # no LLM call at all
-python query.py --stats
+python query.py --stats                            # counts for both versions
 ```
 
+- `--version` — which version to talk to; omit it and you are asked
 - `--fetch-k` — candidates each arm pulls before fusion
-- `--top-k` — knowledge chunks that reach the LLM
+- `--top-k` — chunks that reach the LLM
 - `--show-text` — full chunk text instead of previews
 
 Use `--repl` for anything more than one question: the embedding model and reranker
-take ~30s to load and stay loaded between questions.
+take ~30s to load and stay loaded between questions. Inside the REPL, `:version
+normal` switches database and prompt without reloading them — the fastest way to
+put both answers to one question side by side.
 
 `--retrieval-only` is the one to reach for when tuning. It shows which arm found
 each chunk, so you can tell whether a miss is an embedding problem, a keyword
@@ -175,6 +224,13 @@ psql -h localhost -U postgres -d postgres
 \d structured_chunks
 SELECT content_type, count(*) FROM structured_chunks GROUP BY 1;
 SELECT * FROM structured_story_links;          -- every story with what it illustrates
+```
+
+```bash
+psql -h localhost -U postgres -d normal_chunking
+
+\d normal_chunks
+SELECT count(*) FROM normal_chunks;            -- all of them retrievable
 ```
 
 ---
@@ -248,6 +304,11 @@ id; the fix is to add its id to some knowledge chunk's `related_story_chunk_ids`
 
 Set `ATTACH_LINKED_STORIES=false` to see what pure knowledge retrieval does alone.
 
+The **normal** version is the other half of that experiment: same chunks, but with
+the types and links deleted, so every chunk — narratives included — competes in
+all three arms. `--version normal` is what this section is arguing against, running
+against the same corpus so you can read both answers to the same question.
+
 ### Links are many-to-many, and may cross articles
 
 One knowledge chunk may cite several stories, and one story may be cited by several
@@ -266,6 +327,13 @@ knowledge chunk contributes, trimming from the order your JSON listed them in. T
 ## Configuration
 
 Everything is env-driven; `.env.example` has the full list with commentary.
+
+**Each version owns a database.** `POSTGRES_DB` (default `postgres`) holds the
+structured version, `NORMAL_POSTGRES_DB` (default `normal_chunking`) the flat one.
+Separate databases rather than separate schemas or table prefixes, because a shared
+one would mean a single `articles` table holding both corpora — and then every
+count, every orphan warning and every `--stats` line for one version would be
+polluted by the other's rows. `RAG_VERSION` sets which version the CLIs start on.
 
 **`EMBED_DIM` must match your embedding model.** It sets the `vector(n)` column
 width at table-creation time. `bge-m3` and `bge-large-en-v1.5` are both 1024;

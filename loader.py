@@ -96,6 +96,7 @@ class LoadReport:
     objects_parsed: int = 0
     trailing_commas_repaired: int = 0
     content_type_normalised: int = 0
+    content_type_ignored: int = 0
     legacy_link_keys: int = 0
     cross_article_links: int = 0
     warnings: list[str] = field(default_factory=list)
@@ -112,6 +113,13 @@ class LoadReport:
             log.warning(
                 "lowercased %d chunk_type value(s) (e.g. 'Knowledge' -> 'knowledge')",
                 self.content_type_normalised,
+            )
+        if self.content_type_ignored:
+            log.warning(
+                "ignored chunk_type on %d chunk(s): this file was loaded for the normal "
+                "version, which has no chunk types. Did you mean to ingest data/chunks.json "
+                "with --version structured?",
+                self.content_type_ignored,
             )
         if self.cross_article_links:
             log.info(
@@ -244,7 +252,14 @@ def _extract_links(obj: dict, report: LoadReport, chunk_id) -> list[int]:
     return []
 
 
-def normalise(obj: dict, report: LoadReport) -> RawChunk | None:
+def normalise(obj: dict, report: LoadReport, *, structured: bool = True) -> RawChunk | None:
+    """Turn one raw JSON object into a RawChunk.
+
+    `structured=False` is the normal-chunking version's file: it carries no
+    chunk_type and no links, so both are skipped rather than being required. A
+    chunk_type left in such a file is ignored, not honoured — the flat schema has
+    nowhere to put it, and half-typed chunks would be worse than none.
+    """
     mapped: dict[str, Any] = {}
     for key, value in obj.items():
         target = _FIELD_ALIASES.get(key.strip().lower())
@@ -262,21 +277,40 @@ def normalise(obj: dict, report: LoadReport) -> RawChunk | None:
         report.errors.append(f"chunk {chunk_id}: missing title, skipped")
         return None
 
-    raw_type = str(mapped.get("content_type") or "").strip()
-    content_type = raw_type.lower()
-    if raw_type and raw_type != content_type:
-        report.content_type_normalised += 1
-    if content_type not in {"knowledge", "story"}:
-        report.errors.append(
-            f"chunk {chunk_id}: chunk_type {raw_type!r} is neither 'knowledge' nor 'story', skipped"
-        )
-        return None
+    if structured:
+        raw_type = str(mapped.get("content_type") or "").strip()
+        content_type = raw_type.lower()
+        if raw_type and raw_type != content_type:
+            report.content_type_normalised += 1
+        if content_type not in {"knowledge", "story"}:
+            report.errors.append(
+                f"chunk {chunk_id}: chunk_type {raw_type!r} is neither 'knowledge' nor 'story', skipped"
+            )
+            return None
+    else:
+        if mapped.get("content_type"):
+            report.content_type_ignored += 1
+        content_type = ""
 
     try:
         source_chunk_id = int(chunk_id) if chunk_id is not None else None
     except (TypeError, ValueError):
         report.warnings.append(f"non-integer chunk_id {chunk_id!r}; links to it will not resolve")
         source_chunk_id = None
+
+    if not structured:
+        return RawChunk(
+            source_chunk_id=source_chunk_id,
+            article_name=name,
+            article_url=(mapped.get("article_url") or None),
+            author=(mapped.get("author") or None),
+            published_date=(mapped.get("published_date") or None),
+            site=(mapped.get("site") or None),
+            content_type="",
+            chunk_text=text,
+            links=[],
+            raw=obj,
+        )
 
     links = _extract_links(obj, report, chunk_id)
     if links and content_type == "story":
@@ -300,7 +334,7 @@ def normalise(obj: dict, report: LoadReport) -> RawChunk | None:
     )
 
 
-def load_chunks(path: Path) -> tuple[list[RawChunk], LoadReport]:
+def load_chunks(path: Path, *, structured: bool = True) -> tuple[list[RawChunk], LoadReport]:
     report = LoadReport()
     files = (
         sorted(p for p in path.rglob("*") if p.suffix in {".json", ".jsonl", ".txt"})
@@ -313,7 +347,7 @@ def load_chunks(path: Path) -> tuple[list[RawChunk], LoadReport]:
         objects = parse_objects(file.read_text(encoding="utf-8"), report)
         report.objects_parsed += len(objects)
         for obj in objects:
-            chunk = normalise(obj, report)
+            chunk = normalise(obj, report, structured=structured)
             if chunk:
                 chunks.append(chunk)
     return chunks, report
@@ -337,8 +371,12 @@ def _article_key(chunk: RawChunk) -> str:
     return chunk.article_url or f"title::{chunk.article_name}"
 
 
-def audit(chunks: list[RawChunk], report: LoadReport) -> None:
-    """Warn about links and stories that will not behave as expected."""
+def audit(chunks: list[RawChunk], report: LoadReport, *, structured: bool = True) -> None:
+    """Warn about links and stories that will not behave as expected.
+
+    For the normal version only the duplicate-id check applies: there are no
+    links to dangle and no stories to be orphaned.
+    """
     by_id = {c.source_chunk_id: c for c in chunks if c.source_chunk_id is not None}
 
     seen: set[int] = set()
@@ -348,6 +386,9 @@ def audit(chunks: list[RawChunk], report: LoadReport) -> None:
         if chunk.source_chunk_id in seen:
             report.warnings.append(f"duplicate chunk_id {chunk.source_chunk_id}")
         seen.add(chunk.source_chunk_id)
+
+    if not structured:
+        return
 
     for chunk in chunks:
         for target in chunk.links:
