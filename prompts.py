@@ -294,14 +294,16 @@ a mechanism, a claim, or the events of a narrative.
 # sentinel gives the refusal path something present to trigger on.
 NO_CONTEXT = "=== NO PASSAGES RETRIEVED ==="
 
-_ID_KEYS = ("source_chunk_id", "chunk_id", "id")
 _DATE_KEYS = ("published_at", "article_date", "published_date", "date")
-_LINK_LIST_KEYS = ("linked_knowledge_ids", "linked_chunk_ids", "links")
-
-
-def _chunk_ids(hit: dict) -> list[str]:
-    """Every identifier a knowledge hit might be referenced by, as strings."""
-    return [str(hit[k]) for k in _ID_KEYS if hit.get(k) is not None]
+# `illustrates_chunk_ids` is what retrieval.linked_stories actually writes, and
+# it holds db chunk_ids. It leads because the alternatives are fallbacks for
+# hits assembled elsewhere.
+_LINK_LIST_KEYS = (
+    "illustrates_chunk_ids",
+    "linked_knowledge_ids",
+    "linked_chunk_ids",
+    "links",
+)
 
 
 def _source_label(hit: dict) -> str:
@@ -318,10 +320,12 @@ def _source_label(hit: dict) -> str:
 
 
 def _story_link_ids(hit: dict) -> list[str]:
-    """Corpus-wide IDs of the knowledge this story is linked to.
+    """IDs of the knowledge this story is linked to.
 
-    Prefers a structured list field; falls back to scraping IDs out of a
-    pre-rendered label such as `K7, K12`.
+    Prefers a structured list field, which holds corpus-wide db chunk_ids; falls
+    back to scraping the pre-rendered `linked_knowledge_label`, which holds
+    per-request labels such as `K1, K3`. The two live in different ID spaces, so
+    `_resolve_story_links` keeps a separate lookup for each.
     """
     for key in _LINK_LIST_KEYS:
         value = hit.get(key)
@@ -348,17 +352,33 @@ def _resolve_story_links(
     A story whose links all fall outside the current context is dropped: it has
     no knowledge here to illustrate, so its only remaining role would be as
     free-floating narrative the prompt spends its length forbidding.
+
+    The two ID spaces are resolved separately and never aliased into one table.
+    A knowledge hit carries both a db `chunk_id` and the `source_chunk_id` it was
+    given in the JSON, and those numbers overlap across hits — `json#49 (db 48)`
+    registers both 49 and 48 — so a single flat index lets one hit's
+    source_chunk_id shadow another hit's db id and silently attach a story to the
+    wrong concept.
     """
-    index: dict[str, int] = {}
+    by_chunk_id: dict[str, int] = {}
+    by_label: dict[str, int] = {}
     for i, hit in enumerate(knowledge, start=1):
-        for cid in _chunk_ids(hit):
-            index.setdefault(cid, i)
-            index.setdefault(f"K{cid}", i)
+        if hit.get("chunk_id") is not None:
+            by_chunk_id.setdefault(str(hit["chunk_id"]), i)
+        # `linked_knowledge_label` is already numbered against this same
+        # enumeration, so K<i> maps to itself rather than to a corpus ID.
+        by_label[f"K{i}"] = i
 
     resolved: list[tuple[dict, str]] = []
     for hit in stories:
         raw = _story_link_ids(hit)
-        local = sorted({index[r] for r in raw if r in index})
+        local = sorted(
+            {
+                j
+                for r in raw
+                if (j := by_chunk_id.get(r, by_label.get(r))) is not None
+            }
+        )
 
         if not local:
             log.warning(

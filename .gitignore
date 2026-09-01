@@ -25,6 +25,10 @@ __pycache__/
 # directory once you're sure you don't want it back.
 _archive/
 
+# benchmark.py reports. Written into data/ because that is the only directory
+# bind-mounted out of the container, not because they belong to the corpus.
+data/benchmark_*.md
+
 # Editor / OS / tooling caches
 .vscode/
 .serena/

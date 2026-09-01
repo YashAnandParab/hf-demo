@@ -70,12 +70,36 @@ ORDER BY c.embedding <=> %s::vector
 LIMIT %s
 """
 
+        # `websearch_to_tsquery` ANDs every lexeme, so a natural-language question
+        # only matches a chunk containing all of it — "What is the role of the
+        # Chief Investment Officer at a mutual fund company?" becomes
+        # role & chief & invest & offic & mutual & fund & compani, which nothing
+        # in a prose corpus satisfies. Precise when it fires, so it is still tried
+        # first; `fts_any` below is the recall fallback.
         self.fts = f"""
 SELECT {select},
        ts_rank_cd(c.search_vector, q.query) AS score
 FROM {chunks} c
 JOIN articles a USING (article_id),
      websearch_to_tsquery('english', %s) AS q(query)
+WHERE {knowledge_only}c.search_vector @@ q.query
+ORDER BY score DESC
+LIMIT %s
+"""
+
+        # The same statement with the question's lexemes ORed instead of ANDed.
+        # Stemming and stop-word removal come from running the question through
+        # to_tsvector first, so the query side is lexeme-for-lexeme what the
+        # indexed side holds. ts_rank_cd then does the discriminating: a chunk
+        # matching one common term ranks far below one matching several.
+        self.fts_any = f"""
+SELECT {select},
+       ts_rank_cd(c.search_vector, q.query) AS score
+FROM {chunks} c
+JOIN articles a USING (article_id),
+     to_tsquery('english',
+                array_to_string(tsvector_to_array(to_tsvector('english', %s)), ' | ')
+     ) AS q(query)
 WHERE {knowledge_only}c.search_vector @@ q.query
 ORDER BY score DESC
 LIMIT %s
@@ -133,9 +157,23 @@ def vector_search(query_embedding: list[float], top_k: int | None = None) -> lis
 
 @tracing.traceable(run_type="retriever", name="fts_search")
 def fts_search(query: str, top_k: int | None = None) -> list[dict]:
+    """Lexical arm: all-terms first, any-term as a fallback.
+
+    The strict pass is the one worth having — it fires on quoted phrases, proper
+    nouns and figures, where every term really does co-occur. It just does not
+    fire on questions, which is most of what this arm is asked. Rather than
+    loosening it and losing that precision, an empty result falls through to the
+    ORed form, so the arm contributes a ranking instead of nothing.
+    """
     if not query.strip():
         return []
-    return fetch_all(q().fts, (query, top_k or config.FTS_TOP_K))
+    top_k = top_k or config.FTS_TOP_K
+    hits = fetch_all(q().fts, (query, top_k))
+    if hits:
+        return hits
+    hits = fetch_all(q().fts_any, (query, top_k))
+    log.debug("fts: all-terms empty, any-terms returned %d", len(hits))
+    return hits
 
 
 @tracing.traceable(

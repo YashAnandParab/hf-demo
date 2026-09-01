@@ -240,7 +240,7 @@ def _print_arms(arms: dict[str, list[dict]], fetch_k: int, version) -> None:
 def _empty_arm_hint(name: str) -> str:
     return {
         "vector": "(nothing embedded? run ingest.py)",
-        "fts": "(no lexical overlap — expected for conceptual questions)",
+        "fts": "(no chunk shares even one term with the question)",
         "hq": "(no hypothetical questions indexed; ingest without --no-questions)",
     }.get(name, "")
 
