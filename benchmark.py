@@ -640,6 +640,10 @@ def main() -> None:
     models.embed_query("warmup")
     if config.RERANKER_BACKEND == "local":
         models.rerank("warmup", [{"chunk_id": 0, "chunk_text": "warmup"}], 1)
+    elif config.RERANKER_BACKEND == "http" and not models.reranker_healthy():
+        # Loud, because a benchmark that silently fell back to fusion order would
+        # be reported as a reranked run.
+        raise SystemExit(f"reranker {config.RERANKER_URL} is not answering; aborting benchmark")
 
     cases = _select(args)
     print(f"\nrunning {len(cases)} question(s) against {version.label}")

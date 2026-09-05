@@ -263,7 +263,12 @@ def _print_fusion(fused: list[dict]) -> None:
 
 
 def _print_rerank(knowledge: list[dict], show_text: bool, version) -> None:
-    backend = config.RERANKER_MODEL if config.RERANKER_BACKEND == "local" else "none (fusion order)"
+    if config.RERANKER_BACKEND == "local":
+        backend = config.RERANKER_MODEL
+    elif config.RERANKER_BACKEND == "http":
+        backend = f"{config.RERANKER_MODEL} via {config.RERANKER_URL}"
+    else:
+        backend = "none (fusion order)"
     print(f"\nSTAGE 3 — rerank -> top {len(knowledge)}  ({backend})")
     if not knowledge:
         print("  nothing survived")
@@ -395,6 +400,8 @@ def repl(args) -> None:
     models.embed_query("warmup")
     if config.RERANKER_BACKEND == "local":
         models.rerank("warmup", [{"chunk_id": 0, "chunk_text": "warmup"}], 1)
+    elif config.RERANKER_BACKEND == "http" and not models.reranker_healthy():
+        print(f"  warning: reranker {config.RERANKER_URL} unreachable — fusion order will be used")
     print(
         "ready. Ask a question, ':version <name>' to switch version, "
         "or Ctrl-C / 'exit' to quit."

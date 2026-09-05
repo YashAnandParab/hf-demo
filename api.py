@@ -68,6 +68,11 @@ async def lifespan(_app: FastAPI):
         models.embed_query("warmup")
         if config.RERANKER_BACKEND == "local":
             models.rerank("warmup", [{"chunk_id": 0, "chunk_text": "warmup"}], 1)
+        elif config.RERANKER_BACKEND == "http" and not models.reranker_healthy():
+            # Not fatal: rerank() falls back to fusion order per query, and the
+            # server may still be pulling its model. Log it so a degraded ranking
+            # is visible in the container logs rather than a mystery.
+            log.warning("reranker %s unreachable at startup", config.RERANKER_URL)
     except OSError as exc:
         _abort_if_out_of_memory(exc)
         raise

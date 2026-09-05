@@ -108,10 +108,21 @@ _raw_prefix = os.getenv("EMBED_QUERY_PREFIX")
 EMBED_QUERY_PREFIX = _default_query_prefix(EMBED_MODEL) if _raw_prefix is None else _raw_prefix
 
 # ---------------------------------------------------------------- reranker ---
-# local -> sentence-transformers CrossEncoder
+# local -> sentence-transformers CrossEncoder, weights loaded into this process
+# http  -> a Text Embeddings Inference (TEI) server's /rerank endpoint
 # none  -> keep fusion order (no torch needed at query time)
 RERANKER_BACKEND = os.getenv("RERANKER_BACKEND", "local").lower()
+# Under `local` this is what gets downloaded and loaded. Under `http` the server
+# decides what it serves, so this is only the label shown in output and traces —
+# keep it matching the server's /info model_id or the benchmark report will lie.
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+# The full endpoint, not just the host: TEI also serves /embed and /predict.
+RERANKER_URL = os.getenv("RERANKER_URL", "http://127.0.0.1:8767/rerank")
+RERANKER_TIMEOUT = _float("RERANKER_TIMEOUT", 30.0)
+# TEI rejects a batch larger than its own max_client_batch_size (32 by default)
+# with a 413, and FUSION_TOP_K candidates arrive in one request. Chunking here
+# keeps a raised FUSION_TOP_K from silently dropping the whole rerank stage.
+RERANKER_MAX_BATCH = _int("RERANKER_MAX_BATCH", 32)
 
 # -------------------------------------------------------------- generation ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
